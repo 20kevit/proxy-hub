@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ProxyHub — پنل مدیریت پروکسی</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🛰️ ProxyHub</div>
+  <nav id="nav" class="hidden">
+    <button data-tab="dash" class="active">داشبورد</button>
+    <button data-tab="nodes">نودها</button>
+    <button data-tab="sub">اشتراک</button>
+    <button data-tab="routes">مسیریابی</button>
+    <button data-tab="system">سیستم</button>
+    <button data-tab="settings">تنظیمات</button>
+    <button id="logoutBtn" class="ghost">خروج</button>
+  </nav>
+</header>
+
+<main>
+  <section id="loginView" class="card narrow">
+    <h2>ورود به ProxyHub</h2>
+    <p class="muted">پنل مدیریت فقط با احراز هویت در دسترس است.</p>
+    <label>نام کاربری<input id="username" autocomplete="username"></label>
+    <label>گذرواژه<input id="password" type="password" autocomplete="current-password"></label>
+    <button id="loginBtn">ورود</button>
+    <p id="loginErr" class="error"></p>
+  </section>
+
+  <section id="appView" class="hidden">
+    <section id="tab-dash" class="tab">
+      <div class="grid" id="dashCards"></div>
+      <div class="card">
+        <h3>اقدامات سریع</h3>
+        <div class="row">
+          <button id="quickTest">تست نود فعال</button>
+          <button id="quickUpdate">به‌روزرسانی اشتراک</button>
+          <button id="quickHealth">بررسی سلامت همه</button>
+        </div>
+        <p id="dashMsg" class="muted"></p>
+      </div>
+    </section>
+
+    <section id="tab-nodes" class="tab hidden">
+      <div class="card">
+        <div class="row">
+          <input id="nodeSearch" placeholder="جست‌وجو: نام، سرور، پروتکل…">
+          <select id="nodeFilter">
+            <option value="">همه</option>
+            <option value="healthy">سالم</option>
+            <option value="unhealthy">ناسالم</option>
+            <option value="vless">VLESS</option>
+            <option value="hysteria2">Hysteria2</option>
+            <option value="active">فعال</option>
+          </select>
+        </div>
+      </div>
+      <div id="nodeList"></div>
+    </section>
+
+    <section id="tab-sub" class="tab hidden">
+      <div class="card">
+        <h3>اشتراک</h3>
+        <div id="subInfo"></div>
+        <div class="row">
+          <button id="subUpdateBtn">به‌روزرسانی اکنون</button>
+        </div>
+        <details>
+          <summary>تنظیم URL اشتراک (محرمانه)</summary>
+          <label>URL اشتراک<input id="subUrl" dir="ltr" placeholder="https://…"></label>
+          <button id="subSaveBtn">ذخیره</button>
+          <p class="muted">URL فقط در <code dir="ltr">/etc/proxy-hub/proxy-hub.env</code> ذخیره می‌شود و هرگز کامل نمایش داده نمی‌شود.</p>
+        </details>
+      </div>
+    </section>
+
+    <section id="tab-routes" class="tab hidden">
+      <div class="card">
+        <h3>قوانین مسیریابی (صریح و اختیاری — بدون پروکسی شفاف)</h3>
+        <div id="routeList"></div>
+        <div class="row">
+          <input id="newApp" placeholder="نام اپلیکیشن">
+          <select id="newRoute"><option value="proxy">پروکسی</option><option value="direct">مستقیم</option></select>
+          <button id="addRouteBtn">افزودن</button>
+        </div>
+        <details><summary>اسنیپت محیطی پروکسی (برای اتصال اختیاری اپ‌ها)</summary>
+        <pre id="proxyEnv" dir="ltr"></pre></details>
+      </div>
+    </section>
+
+    <section id="tab-system" class="tab hidden">
+      <div class="card"><h3>سرویس‌ها و شنونده‌ها</h3><div id="sysInfo"></div></div>
+      <div class="card"><h3>رویدادهای اخیر</h3><div id="eventList"></div></div>
+    </section>
+
+    <section id="tab-settings" class="tab hidden">
+      <div class="card">
+        <h3>تنظیمات</h3>
+        <div id="settingsForm"></div>
+        <button id="saveSettingsBtn">ذخیره تنظیمات</button>
+        <p id="settingsMsg" class="muted"></p>
+      </div>
+    </section>
+  </section>
+</main>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>
