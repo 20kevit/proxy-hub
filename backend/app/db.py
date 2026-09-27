@@ -42,6 +42,10 @@ def init_db() -> None:
         cols = {c["name"] for c in _sa.inspect(conn).get_columns("proxy_nodes")}
         if "egress_ok" not in cols:
             conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN egress_ok BOOLEAN DEFAULT 0"))
+        if "last_success" not in cols:
+            conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN last_success DATETIME"))
+        if "success_count" not in cols:
+            conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN success_count INTEGER DEFAULT 0"))
 
 
 def reset_engine() -> None:
