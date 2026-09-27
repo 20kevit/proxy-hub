@@ -48,6 +48,50 @@ class SettingsIn(BaseModel):
     failover_mode: str | None = None
     failover_threshold: int | None = None
     failover_cooldown: int | None = None
+    gateway_enabled: bool | None = None
+    gateway_bind: str | None = None
+    public_socks_port: int | None = None
+    public_http_port: int | None = None
+    default_route: str | None = None
+
+
+class RouteRuleIn(BaseModel):
+    priority: int = 100
+    match_type: str
+    pattern: str
+    port: str = ""
+    network: str = "any"
+    action: str
+    client_scope: str = "all"
+    enabled: bool = True
+    note: str = ""
+
+
+class SimulateIn(BaseModel):
+    domain: str = ""
+    ip: str = ""
+    port: int | None = None
+    network: str = "any"
+    client: str = "all"
+
+
+class ClientIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    username: str | None = None
+    password: str | None = None
+    expires_at: str | None = None
+    dedicated_port: int | None = None
+    max_connections: int = 10
+    notes: str = ""
+
+
+class ClientUpdate(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+    expires_at: str | None = None
+    dedicated_port: int | None = None
+    max_connections: int | None = None
+    notes: str | None = None
 
 
 class SubscriptionIn(BaseModel):
