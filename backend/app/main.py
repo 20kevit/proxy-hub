@@ -11,8 +11,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import auth as auth_api
+from .api import clients as clients_api
+from .api import logs as logs_api
 from .api import manage as manage_api
 from .api import nodes as nodes_api
+from .api import rules as rules_api
 from .api import subscription as sub_api
 from .api import system as system_api
 from .api.deps import current_user
@@ -112,6 +115,9 @@ async def lifespan(app: FastAPI):
     db = get_session_factory()()
     try:
         ensure_defaults(db)
+        from .services.routing_engine import ensure_seed_rules
+
+        ensure_seed_rules(db)
     finally:
         db.close()
     ensure_admin()
@@ -143,6 +149,9 @@ app.include_router(system_api.router)
 app.include_router(nodes_api.router)
 app.include_router(sub_api.router)
 app.include_router(manage_api.router)
+app.include_router(clients_api.router)
+app.include_router(rules_api.router)
+app.include_router(logs_api.router)
 
 
 @app.get("/api/logs")

@@ -70,11 +70,14 @@ def activate_node(session, node: ProxyNode, actor: str = "user", audit=None, rea
     name = type(adapter).__name__
     if name == "SingBoxAdapter" and not adapter.installed():
         raise ValueError("node needs sing-box which is not installed (see System page)")
-    adapter.apply(node)  # validates + restarts managed core; raises CoreError on failure
+    adapter.apply(node, session=session)  # validates + restarts managed core; raises CoreError
+    prev = session.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
     session.query(ProxyNode).update({ProxyNode.is_active: False})
     node.is_active = True
     node.fail_count = 0
     session_set(session, "active_node_id", str(node.id))
+    if prev is not None and prev.id != node.id:
+        session_set(session, "last_prev_node", f"{prev.name} (#{prev.id})")
     session_set(session, "active_core", name.replace("Adapter", "").lower())
     session.commit()
     if audit:

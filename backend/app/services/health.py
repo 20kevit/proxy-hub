@@ -59,8 +59,11 @@ def check_node(session, node: ProxyNode, full_egress: bool = False,
     if ok:
         node.health = "healthy"
         node.fail_count = 0
+        node.success_count = (node.success_count or 0) + 1
+        node.last_success = node.last_checked
     else:
         node.fail_count = (node.fail_count or 0) + 1
+        node.success_count = 0
         node.health = "unhealthy"
     session.commit()
     return node

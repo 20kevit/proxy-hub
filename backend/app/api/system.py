@@ -43,6 +43,8 @@ def status(user: str = Depends(current_user)):
             exit_ip, latency = current_exit_ip(db)
         except Exception:
             exit_ip, latency = "", None
+        gw_enabled = session_get(db, "gateway_enabled",
+                                 str(get_settings().gateway_enabled)).lower() in ("1", "true", "yes", "on")
         return {
             "running": True,
             "uptime_s": int(time.monotonic() - _started),
@@ -67,6 +69,18 @@ def status(user: str = Depends(current_user)):
             "failover": {
                 "mode": session_get(db, "failover_mode", get_settings().failover_mode),
                 "last_reason": session_get(db, "last_failover_reason"),
+                "last_at": session_get(db, "last_failover_at"),
+                "previous_node": session_get(db, "last_prev_node"),
+            },
+            "gateway": {
+                "enabled": gw_enabled,
+                "bind": session_get(db, "gateway_bind", get_settings().gateway_bind),
+                "socks_port": int(session_get(db, "public_socks_port",
+                                              str(get_settings().public_socks_port))),
+                "http_port": int(session_get(db, "public_http_port",
+                                             str(get_settings().public_http_port))),
+                "default_route": session_get(db, "default_route",
+                                             get_settings().default_route),
             },
         }
     finally:
@@ -79,7 +93,10 @@ def node_public(n: ProxyNode) -> dict:
         "port": n.port, "transport": n.transport or "", "security": n.security or "",
         "source": n.source, "tags": n.tags or "", "enabled": n.enabled,
         "removed_upstream": n.removed_upstream, "health": n.health,
-        "latency_ms": n.latency_ms, "egress_ok": bool(n.egress_ok), "last_error": n.last_error or "",
+        "health_state": n.display_health(),
+        "latency_ms": n.latency_ms, "egress_ok": bool(n.egress_ok),
+        "fail_count": n.fail_count or 0, "success_count": n.success_count or 0,
+        "last_success": n.last_success.isoformat() if n.last_success else None, "last_error": n.last_error or "",
         "last_checked": n.last_checked.isoformat() if n.last_checked else None,
         "is_active": n.is_active,
     }

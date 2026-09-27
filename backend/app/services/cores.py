@@ -21,6 +21,28 @@ class CoreError(RuntimeError):
     pass
 
 
+def _db_setting(session, key: str, default: str) -> str:
+    from ..models import Setting
+
+    row = session.query(Setting).filter(Setting.key == key).first()
+    return row.value if row else default
+
+
+def _check_port(port: int, extra: set | None = None) -> None:
+    blocked = set(RESERVED_PORTS) | (extra or set())
+    if port in blocked:
+        raise CoreError(f"port {port} is reserved for internal services")
+    if not 1024 <= port <= 65535:
+        raise CoreError(f"port {port} out of range 1024-65535")
+
+
+def _lock_down(path: Path) -> None:
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
 def managed_socks_url() -> str:
     s = get_settings()
     return f"socks5h://127.0.0.1:{s.socks_port}"
@@ -127,6 +149,11 @@ XRAY_BUILDERS = {
 
 XRAY_CAPABLE = set(XRAY_BUILDERS)
 
+RESERVED_PORTS = {22, 80, 443, 3306, 3389, 4096, 5001, 631, 8000, 8001,
+                  8899, 9011, 1080, 1081, 2080, 2081, 12345}
+
+PRIVATE_DIRECT = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+
 
 class XrayAdapter:
     """Generates/validates the managed Xray config and controls proxyhub-xray.service."""
@@ -136,41 +163,110 @@ class XrayAdapter:
     def capable(self, node: ProxyNode) -> bool:
         return node.protocol in XRAY_CAPABLE
 
-    def generate(self, node: ProxyNode) -> dict:
+    def generate(self, node: ProxyNode, gateway: dict | None = None) -> dict:
+        """gateway dict (or None): bind, socks_port, http_port, accounts [(u,p)],
+        dedicated [(username, port, [(u,p)])], route_rules [xray rules], default_route.
+        """
         builder = XRAY_BUILDERS.get(node.protocol)
         if builder is None:
             raise CoreError(f"xray cannot handle protocol: {node.protocol}")
         settings = get_settings()
+        inbounds = [
+            {"listen": "127.0.0.1", "port": settings.socks_port,
+             "protocol": "socks", "settings": {"udp": True}, "tag": "socks-in"},
+            {"listen": "127.0.0.1", "port": settings.http_port,
+             "protocol": "http", "tag": "http-in"},
+        ]
+        rules: list[dict] = [
+            {"type": "field", "ip": PRIVATE_DIRECT, "outboundTag": "direct"},
+        ]
+        if gateway:
+            bind = gateway["bind"]
+            accts = [{"user": u, "pass": p} for u, p in gateway["accounts"]]
+            if accts:
+                inbounds.append(
+                    {"listen": bind, "port": gateway["socks_port"], "protocol": "socks",
+                     "settings": {"auth": "password", "accounts": accts, "udp": True},
+                     "tag": "gw-socks"})
+                inbounds.append(
+                    {"listen": bind, "port": gateway["http_port"], "protocol": "http",
+                     "settings": {"accounts": accts},
+                     "tag": "gw-http"})
+            for username, port, sub_accts in gateway.get("dedicated", []):
+                inbounds.append(
+                    {"listen": bind, "port": port, "protocol": "socks",
+                     "settings": {"auth": "password",
+                                  "accounts": [{"user": u, "pass": p} for u, p in sub_accts],
+                                  "udp": True},
+                     "tag": f"gw-{username}"})
+            rules.extend(gateway.get("route_rules", []))
+            default = gateway.get("default_route", "proxy")
+        else:
+            default = "proxy"
+        rules.append({"type": "field", "port": "0-65535", "outboundTag": default})
         return {
             "log": {"loglevel": "warning"},
-            "inbounds": [
-                {"listen": "127.0.0.1", "port": settings.socks_port,
-                 "protocol": "socks", "settings": {"udp": True}, "tag": "socks-in"},
-                {"listen": "127.0.0.1", "port": settings.http_port,
-                 "protocol": "http", "tag": "http-in"},
-            ],
+            "inbounds": inbounds,
             "outbounds": [
                 builder(node),
                 {"protocol": "freedom", "tag": "direct"},
                 {"protocol": "blackhole", "tag": "block"},
             ],
-            "routing": {
-                "domainStrategy": "AsIs",
-                "rules": [
-                    {"type": "field",
-                     "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"],
-                     "outboundTag": "direct"},
-                    {"type": "field", "port": "0-65535", "outboundTag": "proxy"},
-                ],
-            },
+            "routing": {"domainStrategy": "AsIs", "rules": rules},
         }
 
-    def write_config(self, node: ProxyNode) -> Path:
+    def gateway_context(self, session) -> dict | None:
+        """Build gateway context from DB. Returns None when gateway disabled."""
+        from ..models import ProxyClient
+        from .clients import client_usable, open_password
+        from .routing_engine import ensure_seed_rules, ordered_rules, to_xray_rule
+
         settings = get_settings()
-        cfg = self.generate(node)
+        enabled = _db_setting(session, "gateway_enabled", str(settings.gateway_enabled))
+        if enabled.lower() not in ("1", "true", "yes", "on"):
+            return None
+        bind = _db_setting(session, "gateway_bind", settings.gateway_bind)
+        if bind not in ("127.0.0.1", "0.0.0.0"):
+            raise CoreError("gateway bind must be 127.0.0.1 or 0.0.0.0")
+        socks_port = int(_db_setting(session, "public_socks_port", str(settings.public_socks_port)))
+        http_port = int(_db_setting(session, "public_http_port", str(settings.public_http_port)))
+        default_route = _db_setting(session, "default_route", settings.default_route)
+        if default_route not in ("direct", "proxy", "block"):
+            raise CoreError("default route must be direct|proxy|block")
+        for port in (socks_port, http_port):
+            _check_port(port)
+        ensure_seed_rules(session)
+        accounts: list[tuple[str, str]] = []
+        dedicated: list[tuple[str, int, list]] = []
+        for client in session.query(ProxyClient).all():
+            usable, _ = client_usable(client)
+            if not usable:
+                continue
+            password = open_password(client.password_enc)
+            accounts.append((client.username, password))
+            if client.dedicated_port:
+                _check_port(client.dedicated_port, extra={socks_port, http_port})
+                dedicated.append((client.username, client.dedicated_port,
+                                  [(client.username, password)]))
+        for _, port, _ in dedicated:
+            _check_port(port, extra={socks_port, http_port})
+        xr_rules = [to_xray_rule(r) for r in ordered_rules(session, only_enabled=True)]
+        return {"bind": bind, "socks_port": socks_port, "http_port": http_port,
+                "accounts": accounts, "dedicated": dedicated,
+                "route_rules": xr_rules, "default_route": default_route}
+
+    def write_config(self, node: ProxyNode, session=None) -> Path:
+        settings = get_settings()
+        gateway = self.gateway_context(session) if session is not None else None
+        cfg = self.generate(node, gateway=gateway)
         settings.xray_config.parent.mkdir(parents=True, exist_ok=True)
+        _lock_down(settings.xray_config.parent)
         tmp = settings.xray_config.with_suffix(".tmp")
         tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
         tmp.replace(settings.xray_config)
         return settings.xray_config
 
@@ -194,13 +290,37 @@ class XrayAdapter:
             raise CoreError(f"proxyhub-xray {action} failed: {out[:300]}")
         return out
 
-    def apply(self, node: ProxyNode) -> None:
-        self.write_config(node)
+    def apply(self, node: ProxyNode, session=None) -> None:
+        if session is not None and node.protocol not in XRAY_CAPABLE:
+            try:
+                if self.gateway_context(session) is not None:
+                    raise CoreError(
+                        "gateway is enabled: activate an Xray-capable node "
+                        "(VLESS/VMess/Trojan/Shadowsocks), not Hysteria2")
+            except CoreError:
+                raise
+            except Exception:
+                pass
+        self.write_config(node, session=session)
         self.validate()
         try:
             self._svc("restart")
         except CoreError:
             self._svc("start")
+
+
+def rebuild_gateway(session) -> dict:
+    """Regenerate managed config for the CURRENT active node and restart.
+
+    Used after client/rule/gateway-setting changes (no node switch).
+    """
+    from ..models import ProxyNode
+
+    active = session.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
+    if active is None:
+        raise CoreError("no active node to rebuild gateway for")
+    XrayAdapter().apply(active, session=session)
+    return {"ok": True, "node_id": active.id}
 
     def status(self) -> dict:
         proc = subprocess.run(

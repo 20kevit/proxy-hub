@@ -107,6 +107,11 @@ def get_settings_api(user: str = Depends(current_user)):
             "failover_cooldown": int(session_get(db, "failover_cooldown", str(s.failover_cooldown))),
             "managed_socks_port": s.socks_port,
             "managed_http_port": s.http_port,
+            "gateway_enabled": session_get(db, "gateway_enabled", str(s.gateway_enabled)).lower() in ("1", "true", "yes", "on"),
+            "gateway_bind": session_get(db, "gateway_bind", s.gateway_bind),
+            "public_socks_port": int(session_get(db, "public_socks_port", str(s.public_socks_port))),
+            "public_http_port": int(session_get(db, "public_http_port", str(s.public_http_port))),
+            "default_route": session_get(db, "default_route", s.default_route),
         }
     finally:
         db.close()
@@ -118,13 +123,34 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
     try:
         data = payload.model_dump(exclude_unset=True)
         allowed = {"sub_update_interval", "health_interval", "health_url",
-                   "failover_mode", "failover_threshold", "failover_cooldown"}
+                   "failover_mode", "failover_threshold", "failover_cooldown",
+                   "gateway_enabled", "gateway_bind", "public_socks_port",
+                   "public_http_port", "default_route"}
+        gw_changed = False
         for key, value in data.items():
             if key in allowed and value is not None:
                 if key == "failover_mode" and value not in ("auto", "manual"):
                     raise HTTPException(400, "failover_mode must be auto|manual")
-                session_set(db, key, str(value))
+                if key == "gateway_bind" and value not in ("127.0.0.1", "0.0.0.0"):
+                    raise HTTPException(400, "gateway_bind must be 127.0.0.1 or 0.0.0.0")
+                if key == "default_route" and value not in ("direct", "proxy", "block"):
+                    raise HTTPException(400, "default_route must be direct|proxy|block")
+                if key in ("public_socks_port", "public_http_port"):
+                    value = int(value)
+                    if not 1024 <= value <= 65535:
+                        raise HTTPException(400, "port out of range 1024-65535")
+                if key in ("gateway_enabled", "gateway_bind", "public_socks_port",
+                           "public_http_port", "default_route"):
+                    gw_changed = True
+                session_set(db, key, str(value).lower() if isinstance(value, bool) else str(value))
         _audit(db, user, "settings.update", ",".join(data.keys()))
+        if gw_changed:
+            from ..services.cores import rebuild_gateway
+
+            try:
+                rebuild_gateway(db)
+            except Exception as exc:
+                raise HTTPException(502, f"تنظیمات ذخیره شد اما بازسازی gateway ناموفق بود: {exc}")
         return {"ok": True}
     finally:
         db.close()

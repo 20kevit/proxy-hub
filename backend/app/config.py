@@ -71,6 +71,12 @@ class Settings:
         self.failover_threshold: int = _int("PROXYHUB_FAILOVER_THRESHOLD", 3)
         self.failover_cooldown: int = _int("PROXYHUB_FAILOVER_COOLDOWN", 600)
 
+        self.gateway_enabled: bool = _bool("PROXYHUB_GATEWAY_ENABLED", False)
+        self.gateway_bind: str = os.getenv("PROXYHUB_GATEWAY_BIND", "127.0.0.1")
+        self.public_socks_port: int = _int("PROXYHUB_PUBLIC_SOCKS_PORT", 8388)
+        self.public_http_port: int = _int("PROXYHUB_PUBLIC_HTTP_PORT", 8389)
+        self.default_route: str = os.getenv("PROXYHUB_DEFAULT_ROUTE", "proxy")
+
 
 @lru_cache
 def get_settings() -> Settings:
