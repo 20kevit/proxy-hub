@@ -3,17 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ProxyHub — پنل مدیریت پروکسی</title>
+<title>ProxyHub — سکوی مدیریت پروکسی</title>
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">🛰️ ProxyHub</div>
+  <div class="brand"><span class="logo">🛰️</span><span>ProxyHub</span></div>
   <nav id="nav" class="hidden">
     <button data-tab="dash" class="active">داشبورد</button>
     <button data-tab="nodes">نودها</button>
+    <button data-tab="routing">مسیریابی</button>
+    <button data-tab="devices">دستگاه‌ها و دسترسی</button>
     <button data-tab="sub">اشتراک</button>
-    <button data-tab="routes">مسیریابی</button>
+    <button data-tab="health">سلامت</button>
+    <button data-tab="logs">گزارش‌ها</button>
     <button data-tab="system">سیستم</button>
     <button data-tab="settings">تنظیمات</button>
     <button id="logoutBtn" class="ghost">خروج</button>
@@ -21,91 +24,149 @@
 </header>
 
 <main>
+  <div id="toasts"></div>
+
   <section id="loginView" class="card narrow">
     <h2>ورود به ProxyHub</h2>
     <p class="muted">پنل مدیریت فقط با احراز هویت در دسترس است.</p>
     <label>نام کاربری<input id="username" autocomplete="username"></label>
     <label>گذرواژه<input id="password" type="password" autocomplete="current-password"></label>
-    <button id="loginBtn">ورود</button>
+    <button id="loginBtn" class="primary">ورود</button>
     <p id="loginErr" class="error"></p>
   </section>
 
   <section id="appView" class="hidden">
     <section id="tab-dash" class="tab">
       <div class="grid" id="dashCards"></div>
+      <div class="cols">
+        <div class="card"><h3>gateway عمومی</h3><div id="gwCard"></div></div>
+        <div class="card"><h3>failover</h3><div id="foCard"></div></div>
+      </div>
       <div class="card">
         <h3>اقدامات سریع</h3>
         <div class="row">
           <button id="quickTest">تست نود فعال</button>
           <button id="quickUpdate">به‌روزرسانی اشتراک</button>
-          <button id="quickHealth">بررسی سلامت همه</button>
         </div>
         <p id="dashMsg" class="muted"></p>
       </div>
     </section>
 
     <section id="tab-nodes" class="tab hidden">
-      <div class="card">
-        <div class="row">
-          <input id="nodeSearch" placeholder="جست‌وجو: نام، سرور، پروتکل…">
-          <select id="nodeFilter">
-            <option value="">همه</option>
-            <option value="healthy">سالم</option>
-            <option value="unhealthy">ناسالم</option>
-            <option value="vless">VLESS</option>
-            <option value="hysteria2">Hysteria2</option>
-            <option value="active">فعال</option>
-          </select>
-        </div>
-      </div>
+      <div class="card"><div class="row">
+        <input id="nodeSearch" placeholder="جست‌وجو: نام، سرور، پروتکل…">
+        <select id="nodeFilter"><option value="">همه</option><option value="active">فعال</option>
+          <option value="HEALTHY">سالم</option><option value="DEGRADED">ناپایدار</option>
+          <option value="UNHEALTHY">ناسالم</option><option value="UNKNOWN">نامشخص</option>
+          <option value="vless">VLESS</option><option value="hysteria2">Hysteria2</option></select>
+        <select id="nodeSort"><option value="active">مرتب: فعال اول</option><option value="latency">مرتب: کمترین تأخیر</option><option value="name">مرتب: نام</option></select>
+      </div></div>
       <div id="nodeList"></div>
     </section>
 
-    <section id="tab-sub" class="tab hidden">
+    <section id="tab-routing" class="tab hidden">
       <div class="card">
-        <h3>اشتراک</h3>
-        <div id="subInfo"></div>
+        <div class="row space"><h3>قوانین ترافیک (اولین تطبیق برنده است)</h3><button id="addRuleBtn">+ افزودن قانون</button></div>
+        <p class="muted">مسیر پیش‌فرض: <b id="defRoute"></b> <button id="defRouteBtn" class="small">تغییر</button></p>
+        <div class="tablewrap"><table id="ruleTable"><thead><tr><th>اولویت</th><th>تطبیق</th><th>عمل</th><th>کلاینت</th><th>وضعیت</th><th>اقدام</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="card">
+        <h3>تست مسیریابی 🧪</h3>
         <div class="row">
-          <button id="subUpdateBtn">به‌روزرسانی اکنون</button>
+          <input id="simDomain" placeholder="دامنه: telegram.org">
+          <input id="simIp" placeholder="IP (اختیاری)" dir="ltr">
+          <input id="simPort" placeholder="پورت (اختیاری)" dir="ltr" type="number">
+          <select id="simClient"><option value="all">همه کلاینت‌ها</option></select>
+          <button id="simBtn">تست</button>
         </div>
-        <details>
-          <summary>تنظیم URL اشتراک (محرمانه)</summary>
+        <div id="simResult" class="simbox muted">یک دامنه وارد و «تست» را بزنید.</div>
+      </div>
+      <div class="card">
+        <h3>مسیریابی سرویس‌های سمت سرور</h3>
+        <p class="muted">این قوانین انتخاب اختیاری هر سرویس است (متغیر محیطی)، نه شناسایی خودکار پردازش روی دستگاه‌های راه‌دور.</p>
+        <div id="routeList"></div>
+        <div class="row"><input id="newApp" placeholder="نام سرویس"><select id="newRoute"><option value="proxy">پروکسی</option><option value="direct">مستقیم</option></select><button id="addRouteBtn">افزودن</button></div>
+        <details><summary>اسنیپت محیطی پروکسی</summary><pre id="proxyEnv" dir="ltr"></pre></details>
+      </div>
+    </section>
+
+    <section id="tab-devices" class="tab hidden">
+      <div class="card">
+        <div class="row space"><h3>دستگاه‌ها و دسترسی</h3><button id="addClientBtn">+ دستگاه جدید</button></div>
+        <p class="muted">هر دستگاه نام‌کاربری/گذرواژه‌ی جدا دارد. گذرواژه فقط لحظه‌ی ساخت/چرخش نمایش داده می‌شود.</p>
+        <div id="gwInfo" class="infobox"></div>
+        <div id="clientList"></div>
+      </div>
+    </section>
+
+    <section id="tab-sub" class="tab hidden">
+      <div class="card"><h3>اشتراک</h3><div id="subInfo"></div>
+        <div class="row"><button id="subUpdateBtn">به‌روزرسانی اکنون</button></div>
+        <details><summary>تنظیم URL اشتراک (محرمانه)</summary>
           <label>URL اشتراک<input id="subUrl" dir="ltr" placeholder="https://…"></label>
           <button id="subSaveBtn">ذخیره</button>
-          <p class="muted">URL فقط در <code dir="ltr">/etc/proxy-hub/proxy-hub.env</code> ذخیره می‌شود و هرگز کامل نمایش داده نمی‌شود.</p>
+          <p class="muted">فقط در <code dir="ltr">/etc/proxy-hub/proxy-hub.env</code> ذخیره و همیشه ماسک‌شده نمایش داده می‌شود.</p>
         </details>
       </div>
     </section>
 
-    <section id="tab-routes" class="tab hidden">
-      <div class="card">
-        <h3>قوانین مسیریابی (صریح و اختیاری — بدون پروکسی شفاف)</h3>
-        <div id="routeList"></div>
-        <div class="row">
-          <input id="newApp" placeholder="نام اپلیکیشن">
-          <select id="newRoute"><option value="proxy">پروکسی</option><option value="direct">مستقیم</option></select>
-          <button id="addRouteBtn">افزودن</button>
-        </div>
-        <details><summary>اسنیپت محیطی پروکسی (برای اتصال اختیاری اپ‌ها)</summary>
-        <pre id="proxyEnv" dir="ltr"></pre></details>
-      </div>
+    <section id="tab-health" class="tab hidden">
+      <div class="card"><h3>وضعیت سلامت نودها</h3><div id="healthList"></div></div>
+    </section>
+
+    <section id="tab-logs" class="tab hidden">
+      <div class="card"><div class="row">
+        <select id="logAction"><option value="">همه رویدادها</option></select>
+        <input id="logActor" placeholder="عامل (مثلاً admin)">
+        <button id="logBtn">نمایش</button>
+      </div><div id="eventList"></div>
+      <p class="muted">لاگ سرویس‌ها: <code dir="ltr">journalctl -u proxy-hub -n 100</code> — هیچ سکرتی در API لاگ برنمی‌گردد.</p></div>
     </section>
 
     <section id="tab-system" class="tab hidden">
       <div class="card"><h3>سرویس‌ها و شنونده‌ها</h3><div id="sysInfo"></div></div>
-      <div class="card"><h3>رویدادهای اخیر</h3><div id="eventList"></div></div>
     </section>
 
     <section id="tab-settings" class="tab hidden">
-      <div class="card">
-        <h3>تنظیمات</h3>
-        <div id="settingsForm"></div>
-        <button id="saveSettingsBtn">ذخیره تنظیمات</button>
-        <p id="settingsMsg" class="muted"></p>
-      </div>
+      <div class="card"><h3>زمان‌بند و سلامت</h3><div id="settingsForm"></div><button id="saveSettingsBtn">ذخیره</button><p id="settingsMsg" class="muted"></p></div>
+      <div class="card"><h3>gateway عمومی و مسیر پیش‌فرض</h3>
+        <p class="muted">فعال‌سازی gateway به‌معنای باز شدن شنونده روی <code dir="ltr">bind</code> است. روی <code dir="ltr">127.0.0.1</code> فقط لوکال؛ روی <code dir="ltr">0.0.0.0</code> عمومی (فقط با تأیید آگاهانه).</p>
+        <div id="gwForm"></div><button id="saveGwBtn">ذخیره gateway</button><p id="gwMsg" class="muted"></p></div>
     </section>
   </section>
 </main>
+
+<dialog id="ruleDialog"><form method="dialog">
+  <h3 id="ruleDlgTitle">قانون جدید</h3>
+  <input type="hidden" id="ruleId">
+  <label>نوع تطبیق<select id="ruleType"><option value="domain_suffix">پسوند دامنه (*.example.com)</option><option value="domain_exact">دامنه دقیق</option><option value="domain_wildcard">wildcard (*.google.*)</option><option value="cidr">CIDR</option><option value="ip">IP تکی</option><option value="port">پورت</option></select></label>
+  <label>الگو<input id="rulePattern" dir="ltr" placeholder="*.telegram.org"></label>
+  <div class="row2"><label>قید پورت (اختیاری)<input id="rulePort" dir="ltr" placeholder="443"></label>
+  <label>شبکه<select id="ruleNet"><option value="any">هر دو</option><option value="tcp">TCP</option><option value="udp">UDP</option></select></label></div>
+  <div class="row2"><label>عمل<select id="ruleAction"><option value="proxy">PROXY</option><option value="direct">DIRECT</option><option value="block">BLOCK</option></select></label>
+  <label>کلاینت<select id="ruleClient"><option value="all">همه</option></select></label></div>
+  <div class="row2"><label>اولویت<input id="rulePrio" type="number" value="100" dir="ltr"></label>
+  <label>یادداشت<input id="ruleNote" placeholder="اختیاری"></label></div>
+  <label class="check"><input type="checkbox" id="ruleEnabled" checked> فعال</label>
+  <p id="ruleErr" class="error"></p>
+  <div class="row"><button id="ruleSave" class="primary" value="default">ذخیره</button><button value="cancel" class="ghost">انصراف</button></div>
+</form></dialog>
+
+<dialog id="clientDialog"><form method="dialog">
+  <h3 id="clientDlgTitle">دستگاه جدید</h3>
+  <label>نام<input id="clientName" placeholder="لپ‌تاپ"></label>
+  <label>نام کاربری (اختیاری، خودکار)<input id="clientUser" dir="ltr" placeholder="laptop_x7"></label>
+  <label>گذرواژه (اختیاری، خودکارِ امن)<input id="clientPass" dir="ltr" placeholder="خالی = تولید خودکار"></label>
+  <label>انقضا (اختیاری)<input id="clientExp" dir="ltr" type="date"></label>
+  <p id="clientErr" class="error"></p>
+  <div class="row"><button id="clientSave" class="primary" value="default">ساخت</button><button value="cancel" class="ghost">انصراف</button></div>
+</form></dialog>
+
+<dialog id="secretDialog"><form method="dialog">
+  <h3>🔑 گذرواژه (فقط همین یک‌بار نمایش داده می‌شود)</h3>
+  <pre id="secretOnce" dir="ltr"></pre>
+  <div class="row"><button id="secretCopy" value="default" class="primary">کپی</button><button value="cancel" class="ghost">بستن</button></div>
+</form></dialog>
 
 <script src="/assets/app.js"></script>
 </body>
