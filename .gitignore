@@ -1,0 +1,41 @@
+# Secrets & environment
+.env
+*.env
+!*.example
+/etc/proxy-hub/
+
+# Runtime data
+*.db
+*.db-journal
+*.sqlite*
+/var/lib/proxy-hub/
+
+# Logs
+*.log
+/var/log/proxy-hub/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend build artifacts
+node_modules/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Backups (may contain secrets)
+/backups/
+*.bak
