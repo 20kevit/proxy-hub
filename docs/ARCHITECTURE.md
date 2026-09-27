@@ -3,19 +3,26 @@
 ## Big picture
 
 ```
-Internet clients (laptop/phone, authenticated)
-      |  SOCKS5 / HTTP (explicit, opt-in; default: localhost only)
+Internet clients (phone/laptop/tablet, per-device auth)
+      |  SOCKS5 :8388 / HTTP :8389  (public gateway inbounds, Xray)
       v
 ProxyHub control plane (FastAPI, 127.0.0.1:8899)
       |
-      +-- managed Xray instance  (proxyhub-xray.service, 127.0.0.1:2081/1081)
-      |       VLESS / VMess / Trojan / Shadowsocks (+REALITY/TLS/WS/gRPC)
-      +-- managed sing-box instance (optional, disabled by default)
-      |       Hysteria2 only
-      +-- system Xray service (UNMANAGED — pre-existing, 127.0.0.1:2080/1080)
+      +-- managed Xray instance  (proxyhub-xray.service)
+      |     127.0.0.1:2081/1081 local + *:8388/8389 gateway (auth)
+      |     routing: seeds -> user rules -> DEFAULT (direct|proxy|block)
+      |       +-- DIRECT -> freedom (VPS egress)
+      |       +-- PROXY  -> active upstream node (VLESS/...)
+      |       +-- BLOCK  -> blackhole
+      +-- managed sing-box instance (optional, Hysteria2 only, no gateway)
+      +-- system Xray service (UNMANAGED — 127.0.0.1:2080/1080)
       v
-Upstream provider nodes  ·  Direct (freedom) for private ranges
+Upstream provider nodes
 ```
+
+The VPS itself never enters the client path: no NAT, no gateway change,
+no global env proxy. Gateway exposure is controlled solely by its bind
+address (no firewall package on this host).
 
 ## Why this shape
 

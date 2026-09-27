@@ -12,6 +12,24 @@
 - Connection limits: single active outbound at a time = one upstream connection
   per protocol session. No concurrency tricks; respects provider device limits.
 
+## Managed instance layout (Phase 2)
+
+The generated `/var/lib/proxy-hub/generated/xray.json` (0600) now contains:
+
+- `socks-in`/`http-in` (127.0.0.1:2081/1081, no auth) — local tooling.
+- `gw-socks`/`gw-http` (bind + 8388/8389, `auth: password`) — public gateway,
+  accounts = currently-usable clients only. Present only when the gateway is
+  enabled AND at least one usable client exists (no anonymous listener, ever).
+- `gw-<username>` dedicated SOCKS inbounds — only for devices with
+  client-scoped rules (per-device port).
+- Routing: private ranges DIRECT → user traffic rules (compiled) → catch-all
+  = configured DEFAULT route.
+
+Every regeneration is validated (`xray run -test`) before restart. If the
+gateway is enabled, activating a Hysteria2 node is refused with a clear error
+(the gateway is Xray-based); disable the gateway first or use an
+Xray-capable node.
+
 ## sing-box (optional, Hysteria2 only) — `SingBoxAdapter`
 
 - Xray cannot reliably terminate Hysteria2, so hy2 nodes need sing-box.

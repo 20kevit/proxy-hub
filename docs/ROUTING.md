@@ -1,49 +1,55 @@
-# Routing
+# Routing engine (Phase 2)
 
-ProxyHub does **explicit routing only**. There is no TProxy/NAT interception, no
-default-route change, no `iptables -t nat` rules. Verified clean:
+Two SEPARATE systems — do not confuse them:
 
-```bash
-iptables -t nat -L -n   # must stay empty
-ip route                # default via 194.60.231.1 dev eth0 (unchanged)
-```
+1. **Traffic rules** (Routing tab): decide DIRECT / PROXY / BLOCK for traffic
+   arriving at the public gateway, based on destination. Compiled into the
+   managed Xray config. This is the routing engine.
+2. **Server-app rules** (Routing tab, lower card): opt-in `direct|proxy` hints
+   per VPS service (OpenCode, MicroChess, …). A service applies them to ITSELF
+   via proxy env vars. Xray never sees process names — a SOCKS gateway cannot
+   identify processes on remote client devices.
 
 ## Rule model
 
-Ordered `app -> direct | proxy` rows (Routing tab). Deterministic: lowest
-`position` first. Defaults:
+`priority` (lower = earlier), `match_type`, `pattern`, optional `port`
+constraint (`443` or `80-443`), optional `network` (`tcp`/`udp`/`any`),
+`action`, `client_scope` (`all` or a device username), `enabled`.
 
-| App | Route | Rationale |
+Evaluation: `(priority ASC, id ASC)`, first match wins. No match → DEFAULT
+route (configurable `direct|proxy|block`, current default `proxy`).
+
+## Match semantics
+
+| Type | Example | Matches |
 |---|---|---|
-| opencode | proxy | AI assistant needs global egress |
-| chrome | proxy | browser via managed proxy |
-| telegram | proxy | client via managed proxy |
-| microchess | direct | production app, never proxied |
-| fide-service | direct | production app, never proxied |
-| ssh | direct | never break admin access |
-| nginx | direct | never proxy the web server |
-| apt | direct | system packages stay direct |
-| git | direct | unless explicitly overridden |
+| `domain_exact` | `telegram.org` | only `telegram.org` (case/trailing-dot normalized, IDN ok) |
+| `domain_suffix` | `*.telegram.org` | `telegram.org` + all subdomains, nothing else |
+| `domain_wildcard` | `*.google.*` | anchored glob, `*` = any chars |
+| `ip` | `1.2.3.4` | that address exactly |
+| `cidr` | `10.0.0.0/8` | prefix membership |
+| `port` | `443`, `80-443` | destination port |
 
-## How an app opts in (example: OpenCode)
+No unrestricted regex from users; wildcard compiles to an anchored Xray
+`regexp:` rule. Anything else is rejected with a Persian message.
 
-OpenCode already uses env proxy vars via a systemd override
-(`/etc/systemd/system/opencode.service.d/override.conf` pointing at the system
-Xray `127.0.0.1:2080`). To move it to the managed core later (safe, reversible):
+## Client-specific rules
 
-```ini
-[Service]
-Environment="HTTP_PROXY=socks5h://127.0.0.1:2081"
-Environment="HTTPS_PROXY=socks5h://127.0.0.1:2081"
-Environment="ALL_PROXY=socks5h://127.0.0.1:2081"
-Environment="NO_PROXY=127.0.0.1,localhost,194.60.231.172"
-```
+Xray cannot match SOCKS-authenticated users in routing (verified empirically),
+so a rule scoped to device `X` compiles with `inboundTag: gw-X`, served by a
+dedicated SOCKS inbound (per-device port, same credentials). Same rule table —
+no duplication. A device without dedicated rules uses the shared gateway port.
 
-```bash
-systemctl daemon-reload && systemctl restart opencode.service
-```
+## Seeds (defaults)
 
-The API also exposes `GET /api/routing` → `proxy_env` snippet for tooling.
-Changing a rule in the panel never touches the app itself; the operator applies
-the snippet per app. Nothing is migrated automatically — preserving working
-services wins over elegance.
+Private ranges + localhost → DIRECT; `*.ir` → DIRECT; TCP/22 → DIRECT;
+default → PROXY. Adjust in the UI; every change rebuilds + validates the
+managed Xray config before restart.
+
+## DNS behavior
+
+- PROXY destinations: `socks5h` semantics — the client sends the hostname, the
+  upstream exit resolves it (no VPS DNS leak for proxied domains).
+- DIRECT destinations: resolved/exited from the VPS path (direct DNS).
+- No VPS-wide DNS change; local/private DNS untouched. DNS routing stays
+  consistent with traffic routing by construction (same rule table).
