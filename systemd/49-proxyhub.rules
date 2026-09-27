@@ -1,0 +1,14 @@
+// Allow the proxyhub service user to manage ONLY its own managed core units.
+// It may NOT touch xray.service or any other unit.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "proxyhub" &&
+        action.id == "org.freedesktop.systemd1.manage-units") {
+        var unit = action.lookup("unit");
+        var verb = action.lookup("verb");
+        if ((unit == "proxyhub-xray.service" || unit == "proxyhub-singbox.service") &&
+            (verb == "start" || verb == "stop" || verb == "restart" ||
+             verb == "reload" || verb == "try-restart")) {
+            return polkit.Result.YES;
+        }
+    }
+});

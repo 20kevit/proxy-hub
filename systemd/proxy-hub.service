@@ -1,0 +1,23 @@
+[Unit]
+Description=ProxyHub control plane (FastAPI, localhost only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxyhub
+Group=proxyhub
+WorkingDirectory=/opt/projects/proxy-hub/backend
+EnvironmentFile=/etc/proxy-hub/proxy-hub.env
+ExecStart=/opt/projects/proxy-hub/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8899 --workers 1
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/proxy-hub
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

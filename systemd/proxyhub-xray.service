@@ -1,0 +1,26 @@
+# Managed Xray instance owned by ProxyHub.
+# The pre-existing system xray.service (port 2080/1080) is NEVER touched by this unit.
+[Unit]
+Description=ProxyHub managed Xray core (localhost only)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/proxy-hub/generated/xray.json
+
+[Service]
+Type=simple
+User=proxyhub
+Group=proxyhub
+ExecStartPre=/usr/local/bin/xray run -test -config /var/lib/proxy-hub/generated/xray.json
+ExecStart=/usr/local/bin/xray run -config /var/lib/proxy-hub/generated/xray.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/proxy-hub
+ProtectHome=true
+PrivateTmp=true
+LimitNPROC=512
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

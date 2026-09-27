@@ -1,0 +1,27 @@
+# Optional managed sing-box instance — only needed for Hysteria2 nodes.
+# Disabled by default. Enable only if you use hy2 nodes:
+#   systemctl enable --now proxyhub-singbox.service
+[Unit]
+Description=ProxyHub managed sing-box core (Hysteria2, localhost only)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/proxy-hub/generated/sing-box.json
+
+[Service]
+Type=simple
+User=proxyhub
+Group=proxyhub
+ExecStartPre=/usr/local/bin/sing-box check -c /var/lib/proxy-hub/generated/sing-box.json
+ExecStart=/usr/local/bin/sing-box run -c /var/lib/proxy-hub/generated/sing-box.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/proxy-hub
+ProtectHome=true
+PrivateTmp=true
+LimitNPROC=512
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target
