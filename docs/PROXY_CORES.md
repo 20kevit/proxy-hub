@@ -1,0 +1,42 @@
+# Proxy cores
+
+## Xray (primary) — `XrayAdapter`
+
+- Binary: `/usr/local/bin/xray` (v26.3.27, pre-existing).
+- Managed unit: `proxyhub-xray.service`, config
+  `/var/lib/proxy-hub/generated/xray.json` (generated, localhost inbounds
+  2081 socks / 1081 http, single active outbound + direct + block).
+- Handles: `vless` (tcp/reality/tls/ws/grpc), `vmess`, `trojan`, `ss`.
+- Every write is validated (`xray run -test`) before restart; the unit also has
+  `ExecStartPre` validation. The system `xray.service` is never referenced.
+- Connection limits: single active outbound at a time = one upstream connection
+  per protocol session. No concurrency tricks; respects provider device limits.
+
+## sing-box (optional, Hysteria2 only) — `SingBoxAdapter`
+
+- Xray cannot reliably terminate Hysteria2, so hy2 nodes need sing-box.
+- Disabled by default (`PROXYHUB_SINGBOX_ENABLED=false`,
+  `proxyhub-singbox.service` not enabled).
+- Install only if you need the hy2 node (official upstream .deb):
+
+```bash
+VERSION=1.12.9  # check https://github.com/SagerNet/sing-box/releases
+curl -fsSLO "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box_${VERSION}_linux_amd64.deb"
+dpkg -i "sing-box_${VERSION}_linux_amd64.deb"
+cp /opt/projects/proxy-hub/systemd/proxyhub-singbox.service /etc/systemd/system/
+systemctl daemon-reload
+```
+
+- Activating a `hysteria2` node without sing-box fails with a clear message
+  pointing at the System page (no silent fallback).
+
+## Public client listener (laptop/phone — explicit operator step)
+
+Defaults are localhost-only (no open proxy). To expose later:
+
+1. Pick a free port (checked via `ss -tlnp`), e.g. 8388.
+2. Add an authenticated inbound (SOCKS user/pass) to the managed config
+   template, bound to that port.
+3. Open ONLY that port in the firewall, restart the managed core, verify auth
+   rejects anonymous clients.
+4. Until then: SSH dynamic tunnel (`ssh -p 9011 -D 1080 user@host`) or VPN.

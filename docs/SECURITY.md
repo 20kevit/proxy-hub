@@ -1,0 +1,35 @@
+# Security model
+
+## Panel authentication
+
+- Username + password, PBKDF2-HMAC-SHA256 (210k rounds).
+- Sessions: HMAC-signed tokens in `httpOnly`, `SameSite=Lax` cookies (12h TTL).
+- CSRF: double-submit cookie (`ph_csrf` + `x-csrf-token` header), enforced by
+  middleware on all mutating `/api/*` calls except login.
+- Login rate limiting: 10 attempts / 5 min per IP (429 afterwards).
+- No default weak credentials: install requires setting `PROXYHUB_ADMIN_PASSWORD`;
+  without it no user exists and login is impossible.
+
+## Proxy endpoint authentication
+
+- Managed listeners bind **127.0.0.1 only** by default — no open proxy.
+- Public client access (laptop/phone) is an explicit operator step:
+  choose a free port, bind with Xray user/pass auth, open only that port.
+  Until then, remote devices connect via SSH tunnel or VPN, never directly.
+- Strong generated credentials required; see PROXY_CORES.md “public listener”.
+
+## Secret handling
+
+- Subscription URL, node UUIDs/passwords/keys live in `/etc/proxy-hub/` and
+  `/var/lib/proxy-hub/` — never in Git, never in the frontend bundle,
+  never in logs, never in API responses (nodes serialize without `secret`;
+  subscription URL is returned masked only).
+- `.gitignore` excludes `.env`, `*.db`, backups, venvs.
+- Audit log records WHO did WHAT (login, activate, routing, settings,
+  failover) without secret values.
+
+## Network posture
+
+- No transparent proxy, no NAT rules, no gateway changes (verified: `iptables -t nat -L` empty).
+- API never exposed directly; use Nginx reverse-proxy + HTTPS for remote panel access.
+- SSH (9011), Nginx, MicroChess, FIDE-Service are out of scope and untouched.
