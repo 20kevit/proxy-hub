@@ -12,6 +12,7 @@ User=proxyhub
 Group=proxyhub
 ExecStartPre=/usr/local/bin/xray run -test -config /var/lib/proxy-hub/generated/xray.json
 ExecStart=/usr/local/bin/xray run -config /var/lib/proxy-hub/generated/xray.json
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

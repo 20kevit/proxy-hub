@@ -43,6 +43,17 @@ def _lock_down(path: Path) -> None:
         pass
 
 
+def _chown_proxyhub(path: Path) -> None:
+    """Ensure file/directory is owned by proxyhub user for service access."""
+    try:
+        import os, pwd, grp
+        uid = pwd.getpwnam("proxyhub").pw_uid
+        gid = grp.getgrnam("proxyhub").gr_gid
+        os.chown(path, uid, gid)
+    except (KeyError, OSError, PermissionError):
+        pass
+
+
 def managed_socks_url() -> str:
     s = get_settings()
     return f"socks5h://127.0.0.1:{s.socks_port}"
@@ -177,9 +188,7 @@ class XrayAdapter:
             {"listen": "127.0.0.1", "port": settings.http_port,
              "protocol": "http", "tag": "http-in"},
         ]
-        rules: list[dict] = [
-            {"type": "field", "ip": PRIVATE_DIRECT, "outboundTag": "direct"},
-        ]
+        rules: list[dict] = []
         if gateway:
             bind = gateway["bind"]
             accts = [{"user": u, "pass": p} for u, p in gateway["accounts"]]
@@ -202,6 +211,7 @@ class XrayAdapter:
             rules.extend(gateway.get("route_rules", []))
             default = gateway.get("default_route", "proxy")
         else:
+            rules.append({"type": "field", "ip": PRIVATE_DIRECT, "outboundTag": "direct"})
             default = "proxy"
         rules.append({"type": "field", "port": "0-65535", "outboundTag": default})
         return {
@@ -261,6 +271,7 @@ class XrayAdapter:
         cfg = self.generate(node, gateway=gateway)
         settings.xray_config.parent.mkdir(parents=True, exist_ok=True)
         _lock_down(settings.xray_config.parent)
+        _chown_proxyhub(settings.xray_config.parent)
         tmp = settings.xray_config.with_suffix(".tmp")
         tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         try:
@@ -268,6 +279,7 @@ class XrayAdapter:
         except OSError:
             pass
         tmp.replace(settings.xray_config)
+        _chown_proxyhub(settings.xray_config)
         return settings.xray_config
 
     def validate(self) -> None:
@@ -290,7 +302,17 @@ class XrayAdapter:
             raise CoreError(f"proxyhub-xray {action} failed: {out[:300]}")
         return out
 
-    def apply(self, node: ProxyNode, session=None) -> None:
+    def reload(self) -> str:
+        """Send SIGHUP to proxyhub-xray for zero-downtime config reload."""
+        proc = subprocess.run(
+            ["systemctl", "reload", "proxyhub-xray"], capture_output=True, text=True, timeout=30
+        )
+        out = (proc.stdout + proc.stderr).strip()
+        if proc.returncode != 0:
+            raise CoreError(f"proxyhub-xray reload failed: {out[:300]}")
+        return out
+
+    def apply(self, node: ProxyNode, session=None, force_restart: bool = False) -> None:
         if session is not None and node.protocol not in XRAY_CAPABLE:
             try:
                 if self.gateway_context(session) is not None:
@@ -301,12 +323,23 @@ class XrayAdapter:
                 raise
             except Exception:
                 pass
+        prev_active = None
+        if session is not None:
+            prev_active = session.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
+        
         self.write_config(node, session=session)
         self.validate()
-        try:
-            self._svc("restart")
-        except CoreError:
-            self._svc("start")
+        
+        if force_restart or prev_active is None or prev_active.id != node.id:
+            try:
+                self._svc("restart")
+            except CoreError:
+                self._svc("start")
+        else:
+            try:
+                self.reload()
+            except CoreError:
+                self._svc("restart")
 
 
 def rebuild_gateway(session) -> dict:
@@ -370,9 +403,16 @@ class SingBoxAdapter:
     def write_config(self, node: ProxyNode) -> Path:
         settings = get_settings()
         settings.singbox_config.parent.mkdir(parents=True, exist_ok=True)
+        _lock_down(settings.singbox_config.parent)
+        _chown_proxyhub(settings.singbox_config.parent)
         tmp = settings.singbox_config.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.generate(node), indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
         tmp.replace(settings.singbox_config)
+        _chown_proxyhub(settings.singbox_config)
         return settings.singbox_config
 
     def validate(self) -> None:

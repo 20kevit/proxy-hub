@@ -23,6 +23,7 @@ from .config import get_settings
 from .db import get_session_factory, init_db
 from .models import Setting, User
 from .services.auth import hash_password
+from .services.health_v2 import health_engine
 from .services.routing import ensure_defaults
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -38,7 +39,6 @@ def ensure_admin() -> None:
         if db.query(User).count() == 0:
             password = settings.admin_password
             if not password:
-                # First-run bootstrap: create locked admin; operator sets password via set-admin.
                 log.warning("no users and PROXYHUB_ADMIN_PASSWORD unset — run scripts/set-admin.sh")
                 return
             db.add(User(username=settings.admin_user, password_hash=hash_password(password)))
@@ -53,14 +53,11 @@ def _setting(db, key: str, default: str) -> str:
     return row.value if row else default
 
 
-async def scheduler_loop() -> None:
-    """In-process timers (single VPS, lightweight): subscription refresh + health sweeps."""
-    from .services.failover import maybe_failover, session_get
-    from .services.health import check_all
+async def subscription_scheduler() -> None:
+    from .services.failover import session_get, session_set
     from .services.subscription import update_subscription
 
-    # Stagger first runs so startup stays fast.
-    await asyncio.sleep(20)
+    await asyncio.sleep(30)
     while True:
         settings = get_settings()
         db = get_session_factory()()
@@ -78,33 +75,36 @@ async def scheduler_loop() -> None:
                         log.warning("scheduled subscription update failed: %s", type(exc).__name__)
                     db2 = get_session_factory()()
                     try:
-                        from .services.failover import session_set as _set
                         _set(db2, "last_sub_run", str(now))
                     finally:
                         db2.close()
             except Exception as exc:
                 log.warning("scheduler subscription pass failed: %s", exc)
-            try:
-                h_interval = int(session_get(db, "health_interval", str(settings.health_interval)))
-                from .models import ProxyNode
-                active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
-                check_all(db, egress_for_active=True)
-                if active is not None:
-                    fresh = db.query(ProxyNode).filter(ProxyNode.id == active.id).first()
-                    if fresh is not None and fresh.health == "unhealthy":
-                        from .models import AuditLog as _Audit
+            await asyncio.sleep(300)
+        finally:
+            db.close()
 
-                        def _audit(a, x, d):
-                            db.add(_Audit(actor=a, action=x, detail=d))
-                            db.commit()
 
-                        res = maybe_failover(db, fresh, audit=_audit)
-                        if res.get("switched"):
-                            log.info("failover: %s", res.get("reason"))
-                await asyncio.sleep(max(h_interval, 60))
-            except Exception as exc:
-                log.warning("scheduler health pass failed: %s", exc)
-                await asyncio.sleep(120)
+async def failover_monitor() -> None:
+    from .services.failover import maybe_failover, session_get
+    from .models import AuditLog, ProxyNode
+
+    await asyncio.sleep(10)
+    while True:
+        db = get_session_factory()()
+        try:
+            active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
+            if active and active.health == "unhealthy" and not active.circuit_open:
+                def _audit(actor, action, detail):
+                    db.add(AuditLog(actor=actor, action=action, detail=detail))
+                    db.commit()
+                res = maybe_failover(db, active, audit=_audit)
+                if res.get("switched"):
+                    log.info("failover: %s", res.get("reason"))
+            await asyncio.sleep(5)
+        except Exception as exc:
+            log.warning("failover monitor error: %s", exc)
+            await asyncio.sleep(10)
         finally:
             db.close()
 
@@ -116,18 +116,26 @@ async def lifespan(app: FastAPI):
     try:
         ensure_defaults(db)
         from .services.routing_engine import ensure_seed_rules
-
         ensure_seed_rules(db)
     finally:
         db.close()
     ensure_admin()
-    task = asyncio.create_task(scheduler_loop())
-    log.info("proxyhub control plane starting")
+    
+    await health_engine.start()
+    
+    sub_task = asyncio.create_task(subscription_scheduler())
+    fo_task = asyncio.create_task(failover_monitor())
+    
+    log.info("proxyhub control plane starting with HealthEngineV2")
     yield
-    task.cancel()
+    
+    await health_engine.stop()
+    sub_task.cancel()
+    fo_task.cancel()
+    await asyncio.gather(sub_task, fo_task, return_exceptions=True)
 
 
-app = FastAPI(title="ProxyHub", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="ProxyHub", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 @app.middleware("http")

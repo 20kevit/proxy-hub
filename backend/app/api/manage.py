@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..config import get_settings
 from ..models import AuditLog, RoutingRule
 from ..schemas import RoutingRuleIn, SettingsIn
-from ..services.failover import session_get, session_set
+from ..services.failover import session_get, session_set, get_failover_config, set_failover_config
 from ..services.routing import ensure_defaults, ordered_rules, proxy_env_snippet
 from .deps import current_user, db_session
 
@@ -98,13 +98,18 @@ def get_settings_api(user: str = Depends(current_user)):
     db = db_session()
     try:
         s = get_settings()
+        fo = get_failover_config(db)
         return {
             "sub_update_interval": int(session_get(db, "sub_update_interval", str(s.sub_update_interval))),
             "health_interval": int(session_get(db, "health_interval", str(s.health_interval))),
+            "active_probe_interval": int(session_get(db, "active_probe_interval", "10")),
+            "deep_probe_interval": int(session_get(db, "deep_probe_interval", "60")),
             "health_url": session_get(db, "health_url", s.health_url),
-            "failover_mode": session_get(db, "failover_mode", s.failover_mode),
-            "failover_threshold": int(session_get(db, "failover_threshold", str(s.failover_threshold))),
-            "failover_cooldown": int(session_get(db, "failover_cooldown", str(s.failover_cooldown))),
+            "health_timeout": int(session_get(db, "health_timeout", str(s.health_timeout))),
+            "failover_mode": fo["mode"],
+            "failover_threshold": fo["threshold"],
+            "failover_cooldown": fo["cooldown"],
+            "failover_min_healthy": fo["min_healthy"],
             "managed_socks_port": s.socks_port,
             "managed_http_port": s.http_port,
             "gateway_enabled": session_get(db, "gateway_enabled", str(s.gateway_enabled)).lower() in ("1", "true", "yes", "on"),
@@ -122,11 +127,13 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
     db = db_session()
     try:
         data = payload.model_dump(exclude_unset=True)
-        allowed = {"sub_update_interval", "health_interval", "health_url",
-                   "failover_mode", "failover_threshold", "failover_cooldown",
+        allowed = {"sub_update_interval", "health_interval", "active_probe_interval", "deep_probe_interval",
+                   "health_url", "health_timeout",
+                   "failover_mode", "failover_threshold", "failover_cooldown", "failover_min_healthy",
                    "gateway_enabled", "gateway_bind", "public_socks_port",
                    "public_http_port", "default_route"}
         gw_changed = False
+        fo_changed = False
         for key, value in data.items():
             if key in allowed and value is not None:
                 if key == "failover_mode" and value not in ("auto", "manual"):
@@ -142,6 +149,8 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
                 if key in ("gateway_enabled", "gateway_bind", "public_socks_port",
                            "public_http_port", "default_route"):
                     gw_changed = True
+                if key in ("failover_mode", "failover_threshold", "failover_cooldown", "failover_min_healthy"):
+                    fo_changed = True
                 session_set(db, key, str(value).lower() if isinstance(value, bool) else str(value))
         _audit(db, user, "settings.update", ",".join(data.keys()))
         if gw_changed:
@@ -151,6 +160,24 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
                 rebuild_gateway(db)
             except Exception as exc:
                 raise HTTPException(502, f"تنظیمات ذخیره شد اما بازسازی gateway ناموفق بود: {exc}")
-        return {"ok": True}
+        return {"ok": True, "failover": get_failover_config(db) if fo_changed else None}
+    finally:
+        db.close()
+
+
+@router.get("/api/failover/config")
+def get_failover_config_api(user: str = Depends(current_user)):
+    db = db_session()
+    try:
+        return get_failover_config(db)
+    finally:
+        db.close()
+
+
+@router.put("/api/failover/config")
+def put_failover_config_api(payload: dict, user: str = Depends(current_user)):
+    db = db_session()
+    try:
+        return set_failover_config(db, **payload)
     finally:
         db.close()

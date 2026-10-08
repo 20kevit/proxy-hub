@@ -24,14 +24,13 @@ class User(Base):
 class ProxyNode(Base):
     __tablename__ = "proxy_nodes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # dedupe key
+    fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(256), default="")
-    protocol: Mapped[str] = mapped_column(String(32), index=True)  # vless/vmess/trojan/ss/hysteria2
+    protocol: Mapped[str] = mapped_column(String(32), index=True)
     server: Mapped[str] = mapped_column(String(256))
     port: Mapped[int] = mapped_column(Integer)
     transport: Mapped[str] = mapped_column(String(32), default="")
     security: Mapped[str] = mapped_column(String(32), default="")
-    # Sensitive payload (uuid/password/keys) — never exposed via API
     secret: Mapped[str] = mapped_column(Text, default="")
     params: Mapped[dict] = mapped_column(JSON, default=dict)
     source: Mapped[str] = mapped_column(String(32), default="subscription")
@@ -49,8 +48,25 @@ class ProxyNode(Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    quality_score: Mapped[float] = mapped_column(Float, default=0.0)
+    tcp_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    handshake_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    app_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latency_variance: Mapped[float] = mapped_column(Float, default=0.0)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    consecutive_successes: Mapped[int] = mapped_column(Integer, default=0)
+    total_probes: Mapped[int] = mapped_column(Integer, default=0)
+    successful_probes: Mapped[int] = mapped_column(Integer, default=0)
+    timeout_count: Mapped[int] = mapped_column(Integer, default=0)
+    connection_reset_count: Mapped[int] = mapped_column(Integer, default=0)
+    tls_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    circuit_open: Mapped[bool] = mapped_column(Boolean, default=False)
+    circuit_open_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_state_change: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rank: Mapped[int] = mapped_column(Integer, default=0)
+    probe_history: Mapped[dict] = mapped_column(JSON, default=dict)
+
     def display_health(self) -> str:
-        """UNKNOWN / HEALTHY / DEGRADED / UNHEALTHY / DISABLED (derived, not stored)."""
         if not self.enabled or self.removed_upstream:
             return "DISABLED"
         if self.last_checked is None:
