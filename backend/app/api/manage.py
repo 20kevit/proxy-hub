@@ -7,7 +7,9 @@ from ..config import get_settings
 from ..models import AuditLog, RoutingRule
 from ..schemas import RoutingRuleIn, SettingsIn
 from ..services.failover import session_get, session_set, get_failover_config, set_failover_config
+from ..services.lifecycle import lifecycle_manager
 from ..services.routing import ensure_defaults, ordered_rules, proxy_env_snippet
+from ..services.watchdog import watchdog
 from .deps import current_user, db_session
 
 router = APIRouter()
@@ -110,6 +112,11 @@ def get_settings_api(user: str = Depends(current_user)):
             "failover_threshold": fo["threshold"],
             "failover_cooldown": fo["cooldown"],
             "failover_min_healthy": fo["min_healthy"],
+            "rotation_enabled": session_get(db, "rotation_enabled", "true").lower() in ("1", "true", "yes", "on"),
+            "rotation_max_duration_hours": int(session_get(db, "rotation_max_duration_hours", "6")),
+            "rotation_exclusion_hours": int(session_get(db, "rotation_exclusion_hours", "24")),
+            "rotation_dry_run": session_get(db, "rotation_dry_run", "false").lower() in ("1", "true", "yes", "on"),
+            "rotation_check_interval": int(session_get(db, "rotation_check_interval", "300")),
             "managed_socks_port": s.socks_port,
             "managed_http_port": s.http_port,
             "gateway_enabled": session_get(db, "gateway_enabled", str(s.gateway_enabled)).lower() in ("1", "true", "yes", "on"),
@@ -130,6 +137,8 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
         allowed = {"sub_update_interval", "health_interval", "active_probe_interval", "deep_probe_interval",
                    "health_url", "health_timeout",
                    "failover_mode", "failover_threshold", "failover_cooldown", "failover_min_healthy",
+                   "rotation_enabled", "rotation_max_duration_hours", "rotation_exclusion_hours",
+                   "rotation_dry_run", "rotation_check_interval",
                    "gateway_enabled", "gateway_bind", "public_socks_port",
                    "public_http_port", "default_route"}
         gw_changed = False
@@ -181,3 +190,30 @@ def put_failover_config_api(payload: dict, user: str = Depends(current_user)):
         return set_failover_config(db, **payload)
     finally:
         db.close()
+
+
+# ---- lifecycle/rotation ----
+
+@router.get("/api/lifecycle/status")
+def get_lifecycle_status(user: str = Depends(current_user)):
+    db = db_session()
+    try:
+        return lifecycle_manager.get_rotation_status(db)
+    finally:
+        db.close()
+
+
+@router.post("/api/lifecycle/rotate")
+async def trigger_rotation(user: str = Depends(current_user)):
+    try:
+        result = await lifecycle_manager.force_rotation()
+        return result
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+# ---- watchdog ----
+
+@router.get("/api/watchdog/status")
+def get_watchdog_status(user: str = Depends(current_user)):
+    return watchdog.get_status()

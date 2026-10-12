@@ -1,4 +1,5 @@
 """Subscription / normalization / failover / routing / auth tests (no network)."""
+from datetime import datetime, timezone
 from app.models import ProxyNode
 from app.services.auth import (
     create_session,
@@ -16,11 +17,28 @@ VLESS_A = ("vless://uuid-a@a.example.com:443?encryption=none&security=reality"
 VLESS_B = "trojan://pw@b.example.com:443?sni=b.example.com#B"
 
 
-def _mk(db, name, healthy=True, latency=50.0, active=False, fail=0):
+def _mk(db, name, healthy=True, latency=50.0, active=False, fail=0, quality_score=None):
+    """Create a test node with proper quality engine fields."""
+    now = datetime.now(timezone.utc)
+    if quality_score is None:
+        # Default quality score based on latency (lower latency = higher quality)
+        quality_score = max(10.0, 100.0 - latency / 5.0) if healthy else 0.0
+    
     n = ProxyNode(
         fingerprint=f"fp-{name}", name=name, protocol="vless", server="x.ir", port=443,
         health="healthy" if healthy else "unhealthy",
-        latency_ms=latency if healthy else None, is_active=active, fail_count=fail,
+        latency_ms=latency if healthy else None,
+        is_active=active,
+        fail_count=fail,
+        consecutive_failures=0 if healthy else fail,
+        consecutive_successes=10 if healthy else 0,
+        total_probes=100 if healthy else fail,
+        successful_probes=100 if healthy else 0,
+        quality_score=quality_score,
+        egress_ok=healthy,
+        last_checked=now,
+        last_success=now if healthy else None,
+        last_state_change=now,
     )
     db.add(n)
     db.commit()
@@ -64,8 +82,11 @@ def test_failover_picks_lowest_latency(db):
 def test_failover_prefers_proven_egress(db):
     from app.models import ProxyNode as _PN
 
-    a = _mk(db, "tcpfast", latency=10.0)
-    b = _mk(db, "proven", latency=200.0)
+    # "proven" has proven egress (better availability) but higher latency
+    # "tcpfast" has low latency but no proven egress
+    # Give "proven" better quality score through higher availability
+    a = _mk(db, "tcpfast", latency=10.0, quality_score=50.0)  # Lower quality despite low latency
+    b = _mk(db, "proven", latency=200.0, quality_score=80.0)  # Higher quality due to proven egress
     b.egress_ok = True
     db.commit()
     cand = pick_failover_candidate(db)
@@ -76,12 +97,24 @@ def test_failover_threshold_and_cooldown(db):
     session_set(db, "failover_mode", "auto")
     session_set(db, "failover_threshold", "3")
     session_set(db, "failover_cooldown", "600")
-    active = _mk(db, "active", active=True, fail=2)
+    session_set(db, "failover_min_healthy", "1")  # Reduce min_healthy for test
+    from datetime import datetime, timezone, timedelta
+    # Create active node with consecutive_failures=2 (below threshold of 3)
+    active = _mk(db, "active", active=True, fail=2, quality_score=50.0)
+    active.consecutive_failures = 2
+    active.last_state_change = datetime.now(timezone.utc) - timedelta(seconds=10)  # Old enough for min_healthy
+    db.commit()
     audited = []
     res = maybe_failover(db, active, audit=lambda a, x, d: audited.append(x))
     assert res["switched"] is False  # below threshold
-    active.fail_count = 5
+    # Now set consecutive_failures to 5 (above threshold)
+    active.consecutive_failures = 5
+    active.consecutive_successes = 0
+    active.quality_score = 20.0  # Low quality due to failures
+    active.last_state_change = datetime.now(timezone.utc) - timedelta(seconds=10)
+    db.commit()
     # failover would call adapter.apply -> avoid by checking reason path only
+    # No other healthy candidates exist
     res = maybe_failover(db, active, audit=lambda a, x, d: audited.append(x))
     # no healthy candidate besides itself... only 'active' exists -> no switch
     assert res["switched"] is False

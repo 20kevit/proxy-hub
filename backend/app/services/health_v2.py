@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import socket
 import time
@@ -16,6 +17,9 @@ from ..db import get_session_factory
 from ..models import ProxyNode
 
 log = logging.getLogger("proxyhub.health_v2")
+
+# Thread pool for blocking I/O operations
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
 
 
 @dataclass
@@ -190,10 +194,10 @@ class HealthEngineV2:
                 await self._fast_check_all()
             except Exception as exc:
                 log.warning("fast_loop error: %s", exc)
-            await asyncio.sleep(1)
+            await asyncio.sleep(30)
     
     async def _active_loop(self):
-        interval = getattr(self.settings, 'active_probe_interval', 10)
+        interval = getattr(self.settings, 'active_probe_interval', 60)
         while self._running:
             try:
                 await self._active_check_all()
@@ -216,7 +220,7 @@ class HealthEngineV2:
                 await self._update_rankings()
             except Exception as exc:
                 log.warning("ranking_loop error: %s", exc)
-            await asyncio.sleep(5)
+            await asyncio.sleep(60)
     
     async def _cleanup_loop(self):
         while self._running:
@@ -227,6 +231,10 @@ class HealthEngineV2:
             await asyncio.sleep(3600)
     
     async def _fast_check_all(self):
+        # Run blocking I/O in thread pool to avoid blocking event loop
+        await asyncio.to_thread(self._fast_check_all_sync)
+    
+    def _fast_check_all_sync(self):
         db = get_session_factory()()
         try:
             nodes = db.query(ProxyNode).filter(
@@ -260,7 +268,9 @@ class HealthEngineV2:
         
         if result.ok:
             node.tcp_latency_ms = result.tcp_latency_ms
-            node.consecutive_failures = 0
+            # Only reset consecutive_failures if egress is OK (don't mask egress failures)
+            if node.egress_ok:
+                node.consecutive_failures = 0
             node.consecutive_successes += 1
             node.total_probes += 1
             node.successful_probes += 1
@@ -285,6 +295,10 @@ class HealthEngineV2:
         node.quality_score = QualityCalculator.calculate(node)
     
     async def _active_check_all(self):
+        # Run blocking I/O in thread pool to avoid blocking event loop
+        await asyncio.to_thread(self._active_check_all_sync)
+    
+    def _active_check_all_sync(self):
         db = get_session_factory()()
         try:
             socks_url = self._get_socks_url(db)
@@ -367,6 +381,10 @@ class HealthEngineV2:
             node.latency_variance = round(variance, 1)
     
     async def _deep_check_all(self):
+        # Run blocking I/O in thread pool to avoid blocking event loop
+        await asyncio.to_thread(self._deep_check_all_sync)
+    
+    def _deep_check_all_sync(self):
         db = get_session_factory()()
         try:
             socks_url = self._get_socks_url(db)
@@ -379,14 +397,10 @@ class HealthEngineV2:
                 ProxyNode.circuit_open.is_(False)
             ).all()
             
-            semaphore = asyncio.Semaphore(3)
+            for node in nodes:
+                result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
+                self._update_deep_metrics(db, node, result)
             
-            async def check_node(node: ProxyNode):
-                async with semaphore:
-                    result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
-                    self._update_deep_metrics(db, node, result)
-            
-            await asyncio.gather(*[check_node(n) for n in nodes], return_exceptions=True)
             db.commit()
         finally:
             db.close()
@@ -456,6 +470,9 @@ class HealthEngineV2:
             return None
     
     async def _update_rankings(self):
+        await asyncio.to_thread(self._update_rankings_sync)
+    
+    def _update_rankings_sync(self):
         db = get_session_factory()()
         try:
             nodes = db.query(ProxyNode).filter(
@@ -472,6 +489,9 @@ class HealthEngineV2:
             db.close()
     
     async def _cleanup_old_data(self):
+        await asyncio.to_thread(self._cleanup_old_data_sync)
+    
+    def _cleanup_old_data_sync(self):
         db = get_session_factory()()
         try:
             cutoff = datetime.now(timezone.utc).date().replace(day=1).isoformat()
