@@ -169,6 +169,15 @@ class HealthEngineV2:
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._lock = asyncio.Lock()
+        # Cycle tracking for monitoring continuity
+        self._last_fast_cycle: datetime | None = None
+        self._last_active_cycle: datetime | None = None
+        self._last_deep_cycle: datetime | None = None
+        self._last_ranking_cycle: datetime | None = None
+        self._fast_cycle_duration_ms: float | None = None
+        self._active_cycle_duration_ms: float | None = None
+        self._deep_cycle_duration_ms: float | None = None
+        self._cycle_failure_count = 0
     
     async def start(self):
         self._running = True
@@ -190,44 +199,65 @@ class HealthEngineV2:
     
     async def _fast_loop(self):
         while self._running:
+            cycle_start = time.monotonic()
             try:
                 await self._fast_check_all()
+                self._fast_cycle_duration_ms = (time.monotonic() - cycle_start) * 1000
+                self._last_fast_cycle = datetime.now(timezone.utc)
+                self._cycle_failure_count = 0
             except Exception as exc:
                 log.warning("fast_loop error: %s", exc)
+                self._cycle_failure_count += 1
             await asyncio.sleep(30)
     
     async def _active_loop(self):
         interval = getattr(self.settings, 'active_probe_interval', 60)
         while self._running:
+            cycle_start = time.monotonic()
             try:
                 await self._active_check_all()
+                self._active_cycle_duration_ms = (time.monotonic() - cycle_start) * 1000
+                self._last_active_cycle = datetime.now(timezone.utc)
+                self._cycle_failure_count = 0
             except Exception as exc:
                 log.warning("active_loop error: %s", exc)
+                self._cycle_failure_count += 1
             await asyncio.sleep(interval)
     
     async def _deep_loop(self):
         interval = getattr(self.settings, 'deep_probe_interval', 60)
         while self._running:
+            cycle_start = time.monotonic()
             try:
                 await self._deep_check_all()
+                self._deep_cycle_duration_ms = (time.monotonic() - cycle_start) * 1000
+                self._last_deep_cycle = datetime.now(timezone.utc)
+                self._cycle_failure_count = 0
             except Exception as exc:
                 log.warning("deep_loop error: %s", exc)
+                self._cycle_failure_count += 1
             await asyncio.sleep(interval)
     
     async def _ranking_loop(self):
+        interval = 60
         while self._running:
+            cycle_start = time.monotonic()
             try:
                 await self._update_rankings()
+                self._last_ranking_cycle = datetime.now(timezone.utc)
             except Exception as exc:
                 log.warning("ranking_loop error: %s", exc)
-            await asyncio.sleep(60)
+            await asyncio.sleep(interval)
     
     async def _cleanup_loop(self):
+        interval = 3600
         while self._running:
+            cycle_start = time.monotonic()
             try:
                 await self._cleanup_old_data()
             except Exception as exc:
                 log.warning("cleanup_loop error: %s", exc)
+            await asyncio.sleep(interval)
             await asyncio.sleep(3600)
     
     async def _fast_check_all(self):
@@ -292,6 +322,7 @@ class HealthEngineV2:
                     node.health = "unhealthy"
                     node.last_state_change = now
         
+        self._record_probe_telemetry(db, node.id, "fast", result)
         node.quality_score = QualityCalculator.calculate(node)
     
     async def _active_check_all(self):
@@ -362,6 +393,7 @@ class HealthEngineV2:
                     node.last_state_change = now
         
         self._update_latency_variance(node, result)
+        self._record_probe_telemetry(db, node.id, "active", result, http_status=200 if result.ok else None)
         node.quality_score = QualityCalculator.calculate(node)
     
     def _update_latency_variance(self, node: ProxyNode, result: ProbeResult):
@@ -443,10 +475,27 @@ class HealthEngineV2:
                     node.health = "unhealthy"
                     node.last_state_change = now
         
+        self._record_probe_telemetry(db, node.id, "deep", result, http_status=200 if result.ok else None)
         self._record_probe_history(node, result)
         node.quality_score = QualityCalculator.calculate(node)
     
-    def _record_probe_history(self, node: ProxyNode, result: ProbeResult):
+    def _record_probe_telemetry(self, db, node_id: int, probe_type: str, result: ProbeResult, http_status: int | None = None):
+        """Record probe result to time-series telemetry table."""
+        try:
+            from ..models import ProbeTelemetry
+            telemetry = ProbeTelemetry(
+                node_id=node_id,
+                probe_type=probe_type,
+                ok=result.ok,
+                latency_ms=result.app_latency_ms or result.handshake_latency_ms or result.tcp_latency_ms,
+                error_type=result.error_type,
+                http_status=http_status,
+            )
+            db.add(telemetry)
+        except Exception as exc:
+            log.warning("Failed to record telemetry: %s", exc)
+
+    def _record_probe_history(self, node: ProbeNode, result: ProbeResult):
         history = node.probe_history or {}
         today = datetime.now(timezone.utc).date().isoformat()
         if today not in history:
@@ -498,9 +547,15 @@ class HealthEngineV2:
             nodes = db.query(ProxyNode).filter(ProxyNode.probe_history.isnot(None)).all()
             for node in nodes:
                 history = node.probe_history or {}
-                history = {k: v for k, v in history.items() if k >= cutoff}
-                node.probe_history = history
+                # Filter out expired entries (keep current month + previous month for safety)
+                filtered = {k: v for k, v in history.items() if k >= cutoff}
+                if len(filtered) != len(history):
+                    node.probe_history = filtered
             db.commit()
+            log.info("Probe history cleanup completed, cutoff=%s", cutoff)
+        except Exception as exc:
+            log.error("Probe history cleanup failed: %s", exc)
+            raise
         finally:
             db.close()
     
@@ -535,3 +590,32 @@ health_engine = HealthEngineV2()
 
 async def get_health_engine() -> HealthEngineV2:
     return health_engine
+
+
+def get_cycle_status() -> dict:
+    """Get health engine cycle status for monitoring."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return {
+        "fast_loop": {
+            "last_cycle": health_engine._last_fast_cycle.isoformat() if health_engine._last_fast_cycle else None,
+            "duration_ms": health_engine._fast_cycle_duration_ms,
+            "seconds_since_last": (now - health_engine._last_fast_cycle).total_seconds() if health_engine._last_fast_cycle else None,
+        },
+        "active_loop": {
+            "last_cycle": health_engine._last_active_cycle.isoformat() if health_engine._last_active_cycle else None,
+            "duration_ms": health_engine._active_cycle_duration_ms,
+            "seconds_since_last": (now - health_engine._last_active_cycle).total_seconds() if health_engine._last_active_cycle else None,
+        },
+        "deep_loop": {
+            "last_cycle": health_engine._last_deep_cycle.isoformat() if health_engine._last_deep_cycle else None,
+            "duration_ms": health_engine._deep_cycle_duration_ms,
+            "seconds_since_last": (now - health_engine._last_deep_cycle).total_seconds() if health_engine._last_deep_cycle else None,
+        },
+        "ranking_loop": {
+            "last_cycle": health_engine._last_ranking_cycle.isoformat() if health_engine._last_ranking_cycle else None,
+            "seconds_since_last": (now - health_engine._last_ranking_cycle).total_seconds() if health_engine._last_ranking_cycle else None,
+        },
+        "cycle_failure_count": health_engine._cycle_failure_count,
+        "running": health_engine._running,
+    }

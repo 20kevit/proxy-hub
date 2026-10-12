@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.ext.mutable import MutableDict
 
 from .db import Base
 
@@ -64,7 +65,7 @@ class ProxyNode(Base):
     circuit_open_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_state_change: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rank: Mapped[int] = mapped_column(Integer, default=0)
-    probe_history: Mapped[dict] = mapped_column(JSON, default=dict)
+    probe_history: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
 
     def display_health(self) -> str:
         if not self.enabled or self.removed_upstream:
@@ -154,3 +155,16 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(64), index=True)
     detail: Mapped[str] = mapped_column(String(1024), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ProbeTelemetry(Base):
+    """Time-series telemetry for probe results."""
+    __tablename__ = "probe_telemetry"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[int] = mapped_column(Integer, index=True)
+    probe_type: Mapped[str] = mapped_column(String(16), index=True)  # fast, active, deep
+    ok: Mapped[bool] = mapped_column(Boolean)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_type: Mapped[str] = mapped_column(String(32), default="")
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)

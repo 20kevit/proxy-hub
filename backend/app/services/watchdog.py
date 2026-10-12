@@ -134,22 +134,36 @@ class Watchdog:
             # Check if health engine tasks are alive
             engine_healthy = health_engine._running
 
-            # Check last health cycle freshness
-            db = get_session_factory()()
-            try:
-                active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
-                if active and active.last_checked:
-                    last_checked = active.last_checked
-                    if last_checked.tzinfo is None:
-                        last_checked = last_checked.replace(tzinfo=timezone.utc)
-                    age = (datetime.now(timezone.utc) - last_checked).total_seconds()
-                    fresh = age < self.config.stale_health_cycle_seconds
-                    details = f"engine_running={engine_healthy}, last_probe_age={age:.0f}s"
-                else:
-                    fresh = False
-                    details = f"engine_running={engine_healthy}, no active node"
-            finally:
-                db.close()
+            # Check cycle freshness using explicit cycle timestamps
+            from .health_v2 import get_cycle_status
+            cycle_status = get_cycle_status()
+            
+            now = datetime.now(timezone.utc)
+            fresh = True
+            stale_cycles = []
+            
+            # Check each cycle loop for staleness
+            for loop_name in ["fast_loop", "active_loop", "deep_loop"]:
+                loop_data = cycle_status.get(loop_name, {})
+                last_cycle_str = loop_data.get("last_cycle")
+                if last_cycle_str:
+                    try:
+                        last_cycle = datetime.fromisoformat(last_cycle_str)
+                        age = (now - last_cycle).total_seconds()
+                        if age > self.config.stale_health_cycle_seconds:
+                            fresh = False
+                            stale_cycles.append(f"{loop_name} stale ({age:.0f}s)")
+                    except ValueError:
+                        pass
+            
+            # Also check for consecutive cycle failures
+            if cycle_status.get("cycle_failure_count", 0) >= self.config.max_consecutive_failures:
+                fresh = False
+                stale_cycles.append(f"{cycle_status['cycle_failure_count']} consecutive cycle failures")
+
+            details = f"engine_running={engine_healthy}, fresh={fresh}"
+            if stale_cycles:
+                details += f", stale_cycles={stale_cycles}"
 
             healthy = engine_healthy and fresh
             self._update_component("health_engine", healthy, details)

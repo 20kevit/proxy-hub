@@ -9,6 +9,7 @@ from ..schemas import RoutingRuleIn, SettingsIn
 from ..services.failover import session_get, session_set, get_failover_config, set_failover_config
 from ..services.lifecycle import lifecycle_manager
 from ..services.routing import ensure_defaults, ordered_rules, proxy_env_snippet
+from ..services.health_v2 import get_cycle_status as get_health_cycle_status
 from ..services.watchdog import watchdog
 from .deps import current_user, db_session
 
@@ -217,3 +218,8 @@ async def trigger_rotation(user: str = Depends(current_user)):
 @router.get("/api/watchdog/status")
 def get_watchdog_status(user: str = Depends(current_user)):
     return watchdog.get_status()
+
+
+@router.get("/api/health/cycles")
+def get_cycle_status(user: str = Depends(current_user)):
+    return get_health_cycle_status()

@@ -1,6 +1,7 @@
 """Subscription / normalization / failover / routing / auth tests (no network)."""
-from datetime import datetime, timezone
-from app.models import ProxyNode
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from app.models import ProxyNode, ProbeTelemetry
 from app.services.auth import (
     create_session,
     hash_password,
@@ -9,8 +10,10 @@ from app.services.auth import (
     verify_password,
 )
 from app.services.failover import maybe_failover, pick_failover_candidate, session_set
+from app.services.health_v2 import HealthEngineV2
 from app.services.routing import DEFAULT_RULES, ensure_defaults, ordered_rules
 from app.services.subscription import mask_url, parse_subscription_text, sync_nodes
+from app.db import get_session_factory
 
 VLESS_A = ("vless://uuid-a@a.example.com:443?encryption=none&security=reality"
            "&sni=s.example.com&fp=chrome&pbk=K&sid=S&type=tcp#A")
@@ -153,3 +156,165 @@ def test_rate_limit():
     for _ in range(10):
         assert rate_limited(ip) is False
     assert rate_limited(ip) is True
+
+
+def test_probe_history_persists_across_restarts(db):
+    """Test that probe_history persists across database sessions."""
+    from app.models import ProbeTelemetry
+    from datetime import datetime, timezone
+    
+    n = ProxyNode(
+        fingerprint="fp-history", name="History Node", protocol="vless", server="x.ir", port=443,
+        health="healthy", latency_ms=50.0, is_active=False,
+        quality_score=80.0, egress_ok=True,
+        last_checked=datetime.now(timezone.utc),
+        last_success=datetime.now(timezone.utc),
+        last_state_change=datetime.now(timezone.utc),
+    )
+    db.add(n)
+    db.commit()
+    node_id = n.id
+    
+    # Simulate recording probe history
+    from app.services.health_v2 import HealthEngineV2
+    engine = HealthEngineV2()
+    
+    from dataclasses import dataclass
+    @dataclass
+    class ProbeResult:
+        ok: bool
+        app_latency_ms: float = None
+        handshake_latency_ms: float = None
+        tcp_latency_ms: float = None
+        error: str = ""
+        error_type: str = ""
+    
+    # Record some probe history
+    db_exp = get_session_factory()()
+    try:
+        node = db_exp.query(ProxyNode).filter(ProxyNode.id == node_id).first()
+        result = ProbeResult(ok=True, app_latency_ms=100.0)
+        engine._record_probe_history(node, result)
+        db_exp.commit()
+        
+        # Verify in same session
+        node = db_exp.query(ProxyNode).filter(ProxyNode.id == node_id).first()
+        assert "2026-10-12" in node.probe_history or len(node.probe_history) > 0
+        hist = node.probe_history
+        today = datetime.now(timezone.utc).date().isoformat()
+        assert today in hist
+        assert hist[today]["probes"] == 1
+        assert hist[today]["success"] == 1
+    finally:
+        db_exp.close()
+    
+    # Verify in NEW session (simulates restart)
+    db_new = get_session_factory()()
+    try:
+        node = db_new.query(ProxyNode).filter(ProxyNode.id == node_id).first()
+        assert today in node.probe_history
+        assert node.probe_history[today]["probes"] == 1
+        assert node.probe_history[today]["success"] == 1
+    finally:
+        db_new.close()
+
+
+def test_telemetry_written_for_each_probe(db):
+    """Test that telemetry is recorded for each probe type."""
+    from app.models import ProbeTelemetry
+    from datetime import datetime, timezone
+    
+    n = ProxyNode(
+        fingerprint="fp-telemetry", name="Telemetry Node", protocol="vless", server="x.ir", port=443,
+        health="healthy", latency_ms=50.0, is_active=False,
+        quality_score=80.0, egress_ok=True,
+        last_checked=datetime.now(timezone.utc),
+        last_success=datetime.now(timezone.utc),
+        last_state_change=datetime.now(timezone.utc),
+    )
+    db.add(n)
+    db.commit()
+    node_id = n.id
+    
+    from app.services.health_v2 import HealthEngineV2
+    engine = HealthEngineV2()
+    
+    @dataclass
+    class ProbeResult:
+        ok: bool
+        app_latency_ms: float = None
+        handshake_latency_ms: float = None
+        tcp_latency_ms: float = None
+        error: str = ""
+        error_type: str = ""
+    
+    # Record telemetry for each probe type
+    db_exp = get_session_factory()()
+    try:
+        engine._record_probe_telemetry(db_exp, node_id, "fast", ProbeResult(ok=True, tcp_latency_ms=10.0))
+        engine._record_probe_telemetry(db_exp, node_id, "active", ProbeResult(ok=True, app_latency_ms=100.0), http_status=200)
+        engine._record_probe_telemetry(db_exp, node_id, "deep", ProbeResult(ok=True, app_latency_ms=200.0), http_status=200)
+        db_exp.commit()
+        
+        # Verify telemetry records
+        telemetry = db_exp.query(ProbeTelemetry).filter(ProbeTelemetry.node_id == node_id).all()
+        assert len(telemetry) == 3
+        probe_types = {t.probe_type for t in telemetry}
+        assert probe_types == {"fast", "active", "deep"}
+        
+        # Check fast probe
+        fast = next(t for t in telemetry if t.probe_type == "fast")
+        assert fast.ok is True
+        assert fast.latency_ms == 10.0
+        
+        # Check active probe
+        active = next(t for t in telemetry if t.probe_type == "active")
+        assert active.ok is True
+        assert active.latency_ms == 100.0
+        assert active.http_status == 200
+        
+        # Check deep probe
+        deep = next(t for t in telemetry if t.probe_type == "deep")
+        assert deep.ok is True
+        assert deep.latency_ms == 200.0
+        assert deep.http_status == 200
+    finally:
+        db_exp.close()
+
+
+def test_probe_history_cleanup_removes_expired(db):
+    """Test that cleanup removes old probe history but keeps recent."""
+    from datetime import datetime, timezone, timedelta
+    
+    n = ProxyNode(
+        fingerprint="fp-cleanup", name="Cleanup Node", protocol="vless", server="x.ir", port=443,
+        health="healthy", latency_ms=50.0, is_active=False,
+        quality_score=80.0, egress_ok=True,
+        last_checked=datetime.now(timezone.utc),
+        last_success=datetime.now(timezone.utc),
+        last_state_change=datetime.now(timezone.utc),
+        probe_history={
+            "2026-09-01": {"probes": 10, "success": 8, "failures": {}},
+            "2026-10-01": {"probes": 10, "success": 10, "failures": {}},
+            "2026-10-12": {"probes": 5, "success": 5, "failures": {}},
+        }
+    )
+    db.add(n)
+    db.commit()
+    node_id = n.id
+    
+    from app.services.health_v2 import HealthEngineV2
+    engine = HealthEngineV2()
+    
+    db_exp = get_session_factory()()
+    try:
+        engine._cleanup_old_data_sync()
+        db_exp.commit()
+        
+        node = db_exp.query(ProxyNode).filter(ProxyNode.id == node_id).first()
+        # Should keep current month (October) and possibly September, remove older
+        assert "2026-09-01" not in node.probe_history  # Too old
+        assert "2026-10-01" in node.probe_history     # Previous month
+        assert "2026-10-12" in node.probe_history     # Current month
+    finally:
+        db_exp.close()
