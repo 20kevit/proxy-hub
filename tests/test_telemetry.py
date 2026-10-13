@@ -17,6 +17,10 @@ def _fresh_login():
 
 
 def _seed_telemetry(db, node_id=7):
+    from sqlalchemy import text as _text
+
+    db.execute(_text("DELETE FROM probe_telemetry"))
+    db.commit()
     now = datetime.now(timezone.utc)
     rows = []
     for i in range(30):
@@ -32,6 +36,51 @@ def _seed_telemetry(db, node_id=7):
     for r in rows:
         db.add(r)
     db.commit()
+
+
+def test_telemetry_correct_beyond_20000_rows():
+    """Totals/series must cover the whole window, not a 20k newest-only sample."""
+    from sqlalchemy import text as _text
+
+    c = _fresh_login()
+    db = get_session_factory()()
+    try:
+        db.execute(_text("DELETE FROM probe_telemetry"))
+        db.commit()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 20500 rows spanning ~142h (< 168h window) via fast bulk insert.
+        payload = [
+            (7, "deep", 1, 100.0 + (i % 500), "",
+             200, (now - timedelta(seconds=i * 25)).isoformat(sep=" "))
+            for i in range(20500)
+        ]
+        raw = db.bind.raw_connection()
+        try:
+            cur = raw.cursor()
+            cur.executemany(
+                "INSERT INTO probe_telemetry (node_id, probe_type, ok, latency_ms,"
+                " error_type, http_status, created_at) VALUES (?,?,?,?,?,?,?)",
+                payload)
+            raw.commit()
+        finally:
+            raw.close()
+        db.expire_all()
+    finally:
+        db.close()
+    r = c.get("/api/telemetry/summary", params={"hours": 168})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["total"] == 20500, d["total"]
+    assert d["latency_samples"] == 20500
+    assert d["p50"] == 349.0 or abs(d["p50"] - 349.5) <= 1.0, d["p50"]
+    r = c.get("/api/telemetry/series",
+              params={"hours": 168, "bucket_minutes": 1440})
+    assert r.status_code == 200, r.text
+    series = r.json()["series"]
+    covered = sum(b["total"] for b in series)
+    assert covered == 20500, covered
+    newest = max(b["bucket"] for b in series)
+    assert "202" in newest  # newest portion of the range is present
 
 
 def test_telemetry_requires_auth():

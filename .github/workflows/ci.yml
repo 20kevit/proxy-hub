@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax and import check
+        run: |
+          python -m compileall -q backend/app tests
+          python -c "import ast, pathlib; [ast.parse(p.read_text()) for p in list(pathlib.Path('backend').rglob('*.py')) + list(pathlib.Path('tests').rglob('*.py'))]; print('imports parse ok')"
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+
+      - name: Verify no secrets staged
+        run: |
+          ! git grep -n -iE "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY" -- . || (echo "private key material in tree" && exit 1)
+          git ls-files | grep -E '\.db$|\.sqlite|\.env$|credential' && (echo "secret-bearing file tracked" && exit 1) || true

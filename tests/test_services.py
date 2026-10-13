@@ -117,11 +117,11 @@ def test_failover_threshold_and_cooldown(db):
     active.last_state_change = datetime.now(timezone.utc) - timedelta(seconds=10)
     db.commit()
     # failover would call adapter.apply -> avoid by checking reason path only
-    # No other healthy candidates exist
+    # No other eligible candidates exist
     res = maybe_failover(db, active, audit=lambda a, x, d: audited.append(x))
-    # no healthy candidate besides itself... only 'active' exists -> no switch
+    # no eligible candidate besides itself... only 'active' exists -> no switch
     assert res["switched"] is False
-    assert res["reason"] == "no healthy candidate"
+    assert res["reason"].startswith("no eligible candidate")
 
 
 def test_failover_manual_mode(db):
@@ -154,6 +154,10 @@ def test_successful_failover_records_last_failed(db, monkeypatch):
     from datetime import datetime, timezone, timedelta
     monkeypatch.setattr("app.services.cores.XrayAdapter.apply",
                         lambda self, node, session=None, force_restart=False: None)
+    monkeypatch.setattr("app.services.cores.verify_node_egress",
+                        lambda node, url, timeout=15: type("R", (), {
+                            "ok": True, "app_latency_ms": 120.0,
+                            "error": "", "error_type": ""})())
     session_set(db, "failover_mode", "auto")
     session_set(db, "failover_threshold", "3")
     session_set(db, "failover_cooldown", "0")

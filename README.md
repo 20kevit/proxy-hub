@@ -22,11 +22,11 @@ clients -> gateway *:8388 (SOCKS5, auth) / *:8389 (HTTP, auth)
 
 1. Panel over HTTPS (Nginx reverse-proxy to loopback API; API itself stays
    on 127.0.0.1). Fallback via SSH tunnel:
-   `ssh -p 9011 -N -L 8899:127.0.0.1:8899 root@194.60.231.172`
+   `ssh -N -L 8899:127.0.0.1:8899 <user>@<server-ip>  # adjust port/user to your SSH setup`
    → `http://127.0.0.1:8899`
 2. Devices & Access → create one client per device (password shown once).
 3. Routing → review rules, use Test (simulator) for any domain/IP/port.
-4. On the device: SOCKS5 `194.60.231.172:8388` (or HTTP `:8389`) + credentials.
+4. On the device: SOCKS5 `<server-ip>:8388` (or HTTP `:8389`) + credentials.
    Full per-OS guide: `docs/CLIENT_ACCESS.md`.
 
 Details: `docs/ARCHITECTURE.md` · decisions: `docs/DECISIONS.md`.
@@ -49,7 +49,7 @@ never listens on a public interface by itself).
 - `frontend/` — static Persian RTL panel (no build step)
 - `systemd/` — `proxy-hub.service`, `proxyhub-xray.service`, `proxyhub-singbox.service`
 - `scripts/` — install, set-admin, backup, restore, proxy-env
-- `tests/` — 61 tests (parsers, sync, failover, routing, auth, API,
+- `tests/` — 85 tests (parsers, sync, failover, routing, auth, API,
   telemetry, CSP/security paths). Run: `.venv/bin/python -m pytest tests/ -q`
 - `docs/` — architecture, installation, security, routing, subscriptions, cores,
   operations, troubleshooting, API, development, decisions, control-panel

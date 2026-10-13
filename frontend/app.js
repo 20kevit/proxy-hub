@@ -182,8 +182,9 @@ $("addRouteBtn").onclick = async () => { const app = $("newApp").value.trim(); i
 async function loadClients() {
   CLIENTS = await api("/api/clients");
   const s = await api("/api/status"); GW = s.gateway || {};
+  const srvHost = location.hostname || "server";
   $("gwInfo").innerHTML = GW.enabled
-    ? `gateway فعال: <span dir="ltr">SOCKS ${esc(GW.bind)}:${GW.socks_port} · HTTP ${GW.http_port}</span> — روی دستگاه: سرور <b dir="ltr">194.60.231.172</b>`
+    ? `gateway فعال: <span dir="ltr">SOCKS ${esc(GW.bind)}:${GW.socks_port} · HTTP ${GW.http_port}</span> — روی دستگاه: سرور <b dir="ltr">${esc(srvHost)}</b>`
     : `<span class="warn">gateway خاموش است.</span> ابتدا از تب تنظیمات فعالش کنید (برای تست لوکال روی 127.0.0.1 بماند).`;
   $("clientList").innerHTML = CLIENTS.map((c) => `
     <div class="client"><div class="head"><strong>${esc(c.name)}</strong>
@@ -200,8 +201,9 @@ async function loadClients() {
 }
 function clientConfig(id) {
   const c = CLIENTS.find((x) => x.id === id);
-  const cfg = `SOCKS5\nServer: 194.60.231.172\nPort: ${GW.socks_port || "?"}\nUsername: ${c.username}\nPassword: (فقط لحظه‌ی ساخت/چرخش)\n\nHTTP\nServer: 194.60.231.172\nPort: ${GW.http_port || "?"}\nUsername: ${c.username}`;
-  const summary = "socks5://" + c.username + "@194.60.231.172:" + (GW.socks_port || "?");
+  const srvHost = location.hostname || "server";
+  const cfg = `SOCKS5\nServer: ${srvHost}\nPort: ${GW.socks_port || "?"}\nUsername: ${c.username}\nPassword: (فقط لحظه‌ی ساخت/چرخش)\n\nHTTP\nServer: ${srvHost}\nPort: ${GW.http_port || "?"}\nUsername: ${c.username}`;
+  const summary = "socks5://" + c.username + "@" + srvHost + ":" + (GW.socks_port || "?");
   $("cfg-" + id).innerHTML = `<pre dir="ltr">${esc(cfg)}</pre><button class="small" data-action="copy-summary" data-text="${esc(summary)}">کپی خلاصه</button>`;
 }
 function clientQR(id) { $("qr-" + id).innerHTML = `<span class="qr"><img src="/api/clients/${id}/qr.png" alt="QR" width="180"></span>`; }
@@ -326,7 +328,7 @@ async function loadTelemetry() {
          <tr><td>تأخیر p50/p95/p99</td><td dir="ltr">${sum.p50 ?? "—"} / ${sum.p95 ?? "—"} / ${sum.p99 ?? "—"} ms (نمونه ${sum.latency_samples})</td></tr>
          <tr><td>کفایت نمونه</td><td>${sum.sufficient_for_percentiles ? "کافی (≥20)" : "ناکافی — درصدها معتبر نیست"}</td></tr></table>`
       : `<p class="muted">داده‌ای در این بازه نیست (صفر نمونه ≠ صفر خطا).</p>`;
-    drawBars("telLatencyChart", ser.series.map((s) => s.bucket), ser.series.map((s) => s.p50 || 0), null);
+    drawBars("telLatencyChart", ser.series.map((s) => s.bucket), ser.series.map((s) => s.avg_latency || 0), null);
     drawBars("telSuccessChart", ser.series.map((s) => s.bucket), ser.series.map((s) => (s.success_rate ?? 0) * 100), null);
     $("telTable").querySelector("tbody").innerHTML = rows.slice(0, 100).map((r) => `<tr><td dir="ltr">${esc(r.at || "")}</td><td>${esc(r.node_name)}</td><td>${esc(r.probe_type)}</td><td>${r.ok ? dot("ok") + " موفق" : dot("bad") + " ناموفق"}</td><td dir="ltr">${r.latency_ms ?? "—"}</td><td>${esc(r.error_type || "")}</td></tr>`).join("");
   } catch (e) { $("telSummary").innerHTML = `<p class="error">${esc(e.message)}</p>`; }

@@ -1,0 +1,570 @@
+"""Regression tests for the remediation findings (isolated temp DB, fakes only)."""
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.db import get_session_factory
+from app.models import ProxyNode
+from test_api import _client_with_admin, _login
+
+
+def _fresh_login():
+    """Login with a cleared rate-limit bucket (in-memory limiter is shared)."""
+    from app.services import auth as _auth
+
+    _auth._attempts.clear()
+    return _login(_client_with_admin())
+
+
+def _mk(db, name, active=False, **kw):
+    now = datetime.now(timezone.utc)
+    base = dict(
+        fingerprint=f"fp-{name}", name=name, protocol="vless", server="x.ir", port=443,
+        health="healthy", latency_ms=50.0, egress_ok=True,
+        last_checked=now, last_success=now, last_state_change=now,
+        consecutive_failures=0, consecutive_successes=10,
+        total_probes=100, successful_probes=100, quality_score=70.0,
+        is_active=active,
+    )
+    base.update(kw)
+    n = ProxyNode(**base)
+    db.add(n)
+    db.commit()
+    return n
+
+
+# --- 1. core status reporting -------------------------------------------
+
+def test_xray_status_never_raises(monkeypatch):
+    import subprocess as _sp
+
+    from app.services.cores import SingBoxAdapter, XrayAdapter
+
+    assert XrayAdapter().status() in (
+        {"active": True, "state": "active"},
+        {"active": False, "state": XrayAdapter().status()["state"]},
+    )
+
+    class P:
+        returncode = 0
+        stdout = "active\n"
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P())
+    assert XrayAdapter().status() == {"active": True, "state": "active"}
+
+    class P2:
+        returncode = 1
+        stdout = "inactive\n"
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P2())
+    assert XrayAdapter().status() == {"active": False, "state": "inactive"}
+
+    def boom(*a, **k):
+        raise FileNotFoundError("no systemctl")
+
+    monkeypatch.setattr(_sp, "run", boom)
+    assert XrayAdapter().status() == {"active": False, "state": "missing"}
+
+    def weird(*a, **k):
+        class Q:
+            returncode = 0
+            stdout = "weird-state\n"
+            stderr = ""
+        return Q()
+
+    monkeypatch.setattr(_sp, "run", weird)
+    assert XrayAdapter().status() == {"active": False, "state": "unknown"}
+    # sing-box consistency: not installed here -> explicit state, never raises
+    assert SingBoxAdapter().status()["state"] in (
+        "not-installed", "active", "inactive", "failed", "unknown", "missing")
+
+
+# --- 3. circuit breaker timing ------------------------------------------
+
+def test_circuit_breaker_opens_with_future_deadline(db, monkeypatch):
+    from app.services import health_v2 as hv
+
+    monkeypatch.setattr(hv, "verify_node_egress", None, raising=False)
+    n = _mk(db, "cb-node")
+    n.consecutive_failures = 4
+    db.commit()
+    eng = hv.HealthEngineV2()
+    result = hv.ProbeResult(ok=False, error="http_timeout", error_type="timeout")
+    eng._update_deep_metrics(db, n, result)
+    db.commit()
+    assert n.circuit_open is True
+    until = n.circuit_open_until
+    assert until is not None
+    aware = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
+    delta = (aware - datetime.now(timezone.utc)).total_seconds()
+    assert delta >= 55, f"breaker must stay open ~cooldown, got {delta}s"
+
+
+def test_circuit_recovery_after_expiry(db, monkeypatch):
+    from app.services import health_v2 as hv
+
+    n = _mk(db, "rec-node")
+    n.circuit_open = True
+    n.circuit_open_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    n.consecutive_failures = 5
+    db.commit()
+    # Expired breaker reopens for probing (TCP probe faked: no network).
+    monkeypatch.setattr(hv, "tcp_probe",
+                        lambda host, port, timeout=2.0: hv.ProbeResult(ok=True, tcp_latency_ms=9.0))
+    eng = hv.HealthEngineV2()
+    eng._fast_check_all_sync()
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == n.id).first()
+    assert row.circuit_open is False
+
+
+def test_circuit_stays_open_until_deadline(db, monkeypatch):
+    from app.services import health_v2 as hv
+
+    probed = []
+    n = _mk(db, "held-node")
+    n.circuit_open = True
+    n.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=600)
+    db.commit()
+
+    def spy(host, port, timeout=2.0):
+        probed.append(host)
+        return hv.ProbeResult(ok=True, tcp_latency_ms=9.0)
+
+    monkeypatch.setattr(hv, "tcp_probe", spy)
+    hv.HealthEngineV2()._fast_check_all_sync()
+    assert probed == []  # open breaker: node skipped, no probe wasted
+    db.expire_all()
+    assert db.query(ProxyNode).filter(ProxyNode.id == n.id).first().circuit_open is True
+
+
+# --- 2D/4. eligibility matrix --------------------------------------------
+
+def test_eligibility_matrix(db):
+    from app.services.failover import node_eligibility
+
+    now = datetime.now(timezone.utc)
+    fresh = {"freshness": 1800, "min_quality": 30.0}
+    ok_node = _mk(db, "elig-ok")
+    assert node_eligibility(ok_node, now, **fresh)[0] is True
+
+    cases = [
+        ({"enabled": False}, False),
+        ({"removed_upstream": True}, False),
+        ({"circuit_open": True}, False),
+        ({"health": "unhealthy"}, False),
+        ({"health": "unknown"}, False),
+        ({"egress_ok": False}, False),
+        ({"quality_score": 10.0}, False),
+    ]
+    for i, (kw, expected) in enumerate(cases):
+        n = _mk(db, f"elig-{i}", **kw)
+        got, reason = node_eligibility(n, now, **fresh)
+        assert got is expected, (kw, reason)
+    stale = _mk(db, "elig-stale")
+    stale.last_success = now - timedelta(hours=2)
+    db.commit()
+    assert node_eligibility(stale, now, **fresh)[0] is False
+
+    from app.services.failover import eligible_candidates
+    cands, rejected = eligible_candidates(db, exclude_id=None)
+    assert any(c.name == "elig-ok" for c in cands)
+    # disabled/removed/circuit-open rows are pre-filtered in SQL; the five
+    # policy rejections below must be reported, not silently skipped.
+    assert sum(rejected.values()) == 5, rejected
+    assert any("no verified egress" in r for r in rejected)
+    assert any("stale egress" in r for r in rejected)
+
+
+# --- 6. rotation concurrency ---------------------------------------------
+
+def test_rotation_single_winner_under_concurrency(db, monkeypatch):
+    """Concurrent transitions serialize; exactly one node ends active."""
+    import threading
+
+    import app.services.failover as fo
+
+    calls = []
+
+    def fake_apply(self, node, session=None, force_restart=False):
+        import time as _t
+        calls.append(node.id)
+        _t.sleep(0.05)
+
+    monkeypatch.setattr("app.services.cores.XrayAdapter.apply", fake_apply)
+    a = _mk(db, "conc-a")
+    b = _mk(db, "conc-b")
+    db.commit()
+    ids = [a.id, b.id]
+    errors = []
+
+    def worker(nid):
+        try:
+            s = get_session_factory()()
+            try:
+                node = s.query(ProxyNode).filter(ProxyNode.id == nid).first()
+                fo.activate_node(s, node, actor="t")
+            finally:
+                s.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in ids for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    db.expire_all()
+    assert db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).count() == 1
+
+
+# --- 5B. subscription active removal -------------------------------------
+
+def test_subscription_removed_active_enters_degraded(db, monkeypatch):
+    """Vanished active node with no replacement -> explicit degraded state."""
+    from app.services.subscription import parse_subscription_text, sync_nodes
+
+    nodes, _ = parse_subscription_text(
+        "vless://uuid-a@a.example.com:443?encryption=none&security=reality"
+        "&sni=s.example.com&fp=chrome&pbk=K&sid=S&type=tcp#A")
+    sync_nodes(db, nodes)
+    node = db.query(ProxyNode).first()
+    node.is_active = True
+    node.egress_ok = True
+    node.health = "healthy"
+    node.last_success = datetime.now(timezone.utc)
+    node.quality_score = 80.0
+    db.commit()
+    # Upstream drops everything and no other node exists.
+    res = sync_nodes(db, [])
+    assert db.query(ProxyNode).first().is_active is False
+    assert res["active_replacement"].startswith("none: degraded")
+    from app.services.failover import session_get
+    assert session_get(db, "degraded_no_active") == "true"
+
+
+def test_subscription_replaces_active_with_verified(db, monkeypatch):
+    """Vanished active node with a healthy replacement -> verified switch."""
+    import app.services.failover as fo
+    from app.services.subscription import parse_subscription_text, sync_nodes
+
+    monkeypatch.setattr("app.services.cores.XrayAdapter.apply",
+                        lambda self, node, session=None, force_restart=False: None)
+    monkeypatch.setattr("app.services.cores.verify_node_egress",
+                        lambda node, url, timeout=15: type("R", (), {
+                            "ok": True, "app_latency_ms": 100.0,
+                            "error": "", "error_type": ""})())
+    nodes, _ = parse_subscription_text(
+        "vless://uuid-a@a.example.com:443?encryption=none&security=reality"
+        "&sni=s.example.com&fp=chrome&pbk=K&sid=S&type=tcp#A")
+    sync_nodes(db, nodes)
+    old = db.query(ProxyNode).first()
+    old.is_active = True
+    db.commit()
+    # A previously verified standby exists (probed in an earlier cycle).
+    # source="manual" so this sync (source="subscription") leaves it alone.
+    standby = _mk(db, "standby-node", source="manual")
+    new_nodes, _ = parse_subscription_text(
+        "vless://uuid-b@b.example.com:443?encryption=none&security=reality"
+        "&sni=s.example.com&fp=chrome&pbk=K&sid=S&type=tcp#B")
+    res = sync_nodes(db, new_nodes)
+    # Freshly synced node B is unverified, so the verified standby wins.
+    assert res.get("active_replacement", "").startswith("subscription-replacement: ")
+    assert "standby-node" in res["active_replacement"]
+    assert db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).count() == 1
+    assert db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first().name == "standby-node"
+
+
+# --- activation failure: no false active ----------------------------------
+
+def test_failed_activation_keeps_previous_active(db, monkeypatch):
+    import app.services.failover as fo
+
+    def boom(self, node, session=None, force_restart=False):
+        from app.services.cores import CoreError
+        raise CoreError("simulated restart failure")
+
+    monkeypatch.setattr("app.services.cores.XrayAdapter.apply", boom)
+    active = _mk(db, "keep-active", active=True)
+    cand = _mk(db, "bad-cand")
+    db.commit()
+    import pytest
+    with pytest.raises(Exception):
+        fo.activate_node(db, cand)
+    db.expire_all()
+    assert db.query(ProxyNode).filter(ProxyNode.id == active.id).first().is_active is True
+    assert db.query(ProxyNode).filter(ProxyNode.id == cand.id).first().is_active is False
+
+
+# --- 7. gateway compatibility ----------------------------------------------
+
+def test_hysteria2_gateway_matrix(db):
+    import app.services.failover as fo
+    from app.models import ProxyClient
+    from app.services.failover import session_set
+
+    hy = ProxyNode(fingerprint="fp-hy", name="HY", protocol="hysteria2",
+                   server="x.ir", port=443, secret="p", params={},
+                   health="healthy", egress_ok=True,
+                   last_checked=datetime.now(timezone.utc),
+                   last_success=datetime.now(timezone.utc),
+                   last_state_change=datetime.now(timezone.utc),
+                   consecutive_successes=5, total_probes=10, successful_probes=10,
+                   quality_score=70.0)
+    db.add(hy)
+    db.commit()
+    # gateway disabled -> compatible (passes gate; may fail later on binary)
+    session_set(db, "gateway_enabled", "false")
+    fo.check_gateway_compatible(db, hy)  # must not raise
+    # gateway enabled -> explicit rejection before any mutation
+    session_set(db, "gateway_enabled", "true")
+    import pytest
+    with pytest.raises(ValueError, match="incompatible"):
+        fo.check_gateway_compatible(db, hy)
+    # xray protocols always pass
+    x = _mk(db, "vx")
+    fo.check_gateway_compatible(db, x)
+
+
+# --- 8. routing inbound consistency ------------------------------------------
+
+def test_client_scoped_rule_requires_dedicated_port(db):
+    from app.models import ProxyClient, RouteRule
+    from app.services.auth import hash_password
+    from app.services.routing_engine import validate_client_scope
+    from app.services.routing_engine import RuleError
+    import pytest
+
+    c = ProxyClient(username="nodedi", password_hash=hash_password("x" * 12),
+                    password_enc="")
+    db.add(c)
+    db.commit()
+    with pytest.raises(RuleError):
+        validate_client_scope(db, "nodedi")
+    c.dedicated_port = 42999
+    db.commit()
+    validate_client_scope(db, "nodedi")  # must not raise
+    with pytest.raises(RuleError):
+        validate_client_scope(db, "ghost")
+
+
+# --- 10. protocol parameter preservation --------------------------------------
+
+def test_protocol_params_preserved():
+    from app.services.cores import (_ss_outbound, _trojan_outbound,
+                                    _vless_outbound, _vmess_outbound)
+    from app.models import ProxyNode
+
+    def N(**kw):
+        base = dict(protocol="vless", server="s.ir", port=443, secret="u",
+                    security="", params={})
+        base.update(kw)
+        return ProxyNode(fingerprint="x", name="n", **base)
+
+    vless = _vless_outbound(N(protocol="vless", security="tls",
+                              params={"sni": "e.com", "fp": "chrome",
+                                      "alpn": "h2,http/1.1", "type": "tcp"}))
+    assert vless["streamSettings"]["tlsSettings"]["serverName"] == "e.com"
+    assert vless["streamSettings"]["tlsSettings"]["alpn"] == ["h2", "http/1.1"]
+
+    vmess = _vmess_outbound(N(protocol="vmess", security="tls",
+                              params={"net": "ws", "tls": "tls", "sni": "e.com",
+                                      "path": "/p", "host": "h.com", "aid": "0"}))
+    assert vmess["streamSettings"]["tlsSettings"]["serverName"] == "e.com"
+    assert vmess["streamSettings"]["wsSettings"]["path"] == "/p"
+
+    trojan = _trojan_outbound(N(protocol="trojan", security="tls",
+                                params={"sni": "e.com", "type": "tcp"}))
+    assert trojan["streamSettings"]["tlsSettings"]["serverName"] == "e.com"
+
+    ss = _ss_outbound(N(protocol="ss", params={"method": "2022-blake3-aes-128-gcm"}))
+    assert ss["settings"]["servers"][0]["method"] == "2022-blake3-aes-128-gcm"
+
+
+def test_hysteria2_unsupported_tls_modes_rejected():
+    from app.services.cores import CoreError, SingBoxAdapter
+    from app.models import ProxyNode
+    import pytest
+
+    def N(**params):
+        return ProxyNode(fingerprint="x", name="n", protocol="hysteria2",
+                         server="s.ir", port=443, secret="p", params=params)
+
+    with pytest.raises(CoreError, match="insecure"):
+        SingBoxAdapter().generate(N(insecure="1"))
+    with pytest.raises(CoreError, match="pinSHA256"):
+        SingBoxAdapter().generate(N(pinSHA256="abc"))
+    ok = SingBoxAdapter().generate(N(sni="e.com", obfs="salamander",
+                                     obfs_password="pw123"))
+    assert ok["outbounds"][0]["obfs"] == {"type": "salamander", "password": "pw123"}
+
+
+# --- 5A/11. API validation boundaries ------------------------------------------
+
+def test_failover_config_schema_bounds():
+    cl = _fresh_login()
+    assert cl.put("/api/failover/config", json={"threshold": 0}).status_code == 422
+    assert cl.put("/api/failover/config", json={"cooldown": -5}).status_code == 422
+    assert cl.put("/api/failover/config", json={"mode": "sometimes"}).status_code == 400
+    r = cl.put("/api/failover/config", json={"threshold": 5})
+    assert r.status_code == 200 and r.json()["threshold"] == 5
+
+
+def test_settings_reject_bad_values():
+    cl = _fresh_login()
+    assert cl.put("/api/settings", json={"failover_mode": "sometimes"}).status_code == 400
+    assert cl.put("/api/settings", json={"gateway_bind": "8.8.8.8"}).status_code == 400
+    assert cl.put("/api/settings", json={"public_socks_port": 80}).status_code == 400
+    assert cl.put("/api/settings", json={"health_url": "not-a-url"}).status_code == 422
+    assert cl.put("/api/settings", json={"health_url": "http://169.254.169.254/"}).status_code == 422
+
+
+def test_subscription_url_validation():
+    cl = _fresh_login()
+    assert cl.put("/api/subscription", json={"url": "not-a-url"}).status_code == 422
+    assert cl.put("/api/subscription", json={"url": "ftp://x/y"}).status_code == 422
+    assert cl.put("/api/subscription", json={"url": "http://169.254.169.254/"}).status_code == 422
+    assert cl.put("/api/subscription", json={"url": "http://127.0.0.1/x"}).status_code == 422
+
+
+# --- 5C. session revocation -----------------------------------------------------
+
+def test_logout_revokes_token():
+    from app.services import auth as _auth
+
+    _auth._attempts.clear()
+    c = _client_with_admin()
+    r = c.post("/api/auth/login", json={"username": "admin", "password": "pw123456"})
+    assert r.status_code == 200
+    csrf = r.json()["csrf"]
+    c.headers.update({"x-csrf-token": csrf})
+    assert c.get("/api/auth/me").status_code == 200
+    assert c.post("/api/auth/logout").status_code == 200
+    # Old token must now be rejected server-side (cookie still present).
+    assert c.get("/api/auth/me").status_code == 401
+
+
+def test_password_change_revokes_tokens(db):
+    from app.models import User
+    from app.services.auth import (bump_session_version, create_session,
+                                   hash_password, parse_session_verified)
+
+    db.add(User(username="u1", password_hash=hash_password("x" * 12)))
+    db.commit()
+    tok = create_session("u1", 0)
+    assert parse_session_verified(tok, db) == "u1"
+    bump_session_version(db, "u1")
+    assert parse_session_verified(tok, db) is None
+    tok2 = create_session("u1", 1)
+    assert parse_session_verified(tok2, db) == "u1"
+    # forged version field fails signature
+    assert parse_session_verified(tok[:-1] + ("0" if tok[-1] != "0" else "1"), db) is None
+
+
+def test_missing_secret_key_fails_closed(monkeypatch):
+    import app.services.clients as cl
+
+    monkeypatch.delenv("PROXYHUB_SECRET_KEY", raising=False)
+    monkeypatch.setattr("app.services.clients._HAS_CRYPTO", True)
+    import pytest
+    with pytest.raises(RuntimeError, match="PROXYHUB_SECRET_KEY"):
+        cl._fernet()
+
+
+# --- 9. validate-before-replace + rollback -----------------------------------------
+
+def _fake_settings(tmp_path):
+    import types
+
+    return types.SimpleNamespace(
+        xray_config=tmp_path / "xray.json",
+        xray_bin="/nonexistent-xray",
+        socks_port=2081, http_port=1081,
+    )
+
+
+def _vless_node():
+    from app.models import ProxyNode
+    return ProxyNode(fingerprint="fp-v", name="V", protocol="vless",
+                     server="s.ir", port=443, secret="u", params={})
+
+
+def test_invalid_candidate_preserves_live_config(tmp_path, monkeypatch):
+    from app.services import cores as C
+
+    live = tmp_path / "xray.json"
+    live.write_text('{"known": "good"}')
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.XrayAdapter, "_validate_path",
+                        lambda self, path: (_ for _ in ()).throw(
+                            C.CoreError("simulated invalid candidate")))
+    import pytest
+    with pytest.raises(C.CoreError):
+        C.XrayAdapter().apply(_vless_node(), session=None)
+    assert live.read_text() == '{"known": "good"}'
+    assert list(tmp_path.glob("xray-*.json")) == []  # temp cleaned up
+
+
+def test_restart_failure_restores_previous_config(tmp_path, monkeypatch):
+    from app.services import cores as C
+
+    live = tmp_path / "xray.json"
+    live.write_text('{"known": "good"}')
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.XrayAdapter, "_validate_path", lambda self, path: None)
+    monkeypatch.setattr(C.XrayAdapter, "_svc",
+                        lambda self, action: (_ for _ in ()).throw(
+                            C.CoreError(f"simulated {action} failure")))
+    import pytest
+    with pytest.raises(C.CoreError, match="previous config restored"):
+        C.XrayAdapter().apply(_vless_node(), session=None, force_restart=True)
+    assert live.read_text() == '{"known": "good"}'
+
+
+# --- 8. migrations -------------------------------------------------------------------
+
+def test_migrations_idempotent_and_versioned(tmp_path):
+    import sqlalchemy as sa
+    from app import migrations as mig
+
+    url = f"sqlite:///{tmp_path}/old.db"
+    eng = sa.create_engine(url)
+    with eng.begin() as conn:
+        # Simulate a pre-v1 database: users + bare proxy_nodes only.
+        conn.execute(sa.text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username VARCHAR(64),"
+            " password_hash VARCHAR(256), created_at DATETIME)"))
+        conn.execute(sa.text(
+            "CREATE TABLE proxy_nodes (id INTEGER PRIMARY KEY,"
+            " fingerprint VARCHAR(64), name VARCHAR(256))"))
+        conn.execute(sa.text(
+            "INSERT INTO proxy_nodes (id, fingerprint, name) VALUES (1, 'fp', 'Old')"))
+    with eng.begin() as conn:
+        assert mig.current_version(conn) == 0
+        assert mig.migrate(conn) == mig.SCHEMA_VERSION
+        # Data preserved, new columns present.
+        assert conn.execute(sa.text("SELECT name FROM proxy_nodes WHERE id=1")).first()[0] == "Old"
+        cols = {c["name"] for c in sa.inspect(conn).get_columns("proxy_nodes")}
+        assert {"egress_ok", "quality_score", "probe_history", "consecutive_failures"} <= cols
+        assert "probe_telemetry" in {t for t in sa.inspect(conn).get_table_names()}
+        assert "session_version" in {c["name"] for c in sa.inspect(conn).get_columns("users")}
+        # Second run is a no-op.
+        assert mig.migrate(conn) == mig.SCHEMA_VERSION
+    eng.dispose()
+
+
+# --- 5F + misc --------------------------------------------------------------------
+
+def test_max_connections_is_metadata():
+    c = _login_here()
+    r = c.get("/api/clients")
+    assert r.status_code == 200
+    for cli in r.json():
+        assert cli["max_connections_enforced"] is False
+
+
+def _login_here():
+    return _fresh_login()

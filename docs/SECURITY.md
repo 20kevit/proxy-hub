@@ -42,6 +42,35 @@
   caps are NOT natively enforced by Xray — documented limitation (abuse is
   contained via disable/rotate/expire + conservative timeouts).
 
+## Admin sessions and revocation
+
+- Sessions are HMAC-signed tokens (username · expiry · nonce · version) with
+  a 12h TTL, `HttpOnly` + `SameSite=lax` cookies (`Secure` on HTTPS), and
+  CSRF tokens on all mutating API calls.
+- Logout and admin password changes bump a server-side `session_version`,
+  so previously issued tokens are rejected even if still unexpired or
+  replayed — verified by regression tests (logout, password-change,
+  forged-version, expiry, CSRF, rate limiting).
+- A process restart with an unchanged `PROXYHUB_SECRET_KEY` keeps existing
+  sessions valid; changing the secret key invalidates all sessions
+  (fail-closed: re-login required).
+
+## Encryption-key lifecycle (`PROXYHUB_SECRET_KEY`)
+
+- Client passwords are stored PBKDF2-hashed (verification) plus
+  Fernet-encrypted (needed to render Xray inbound accounts), with the key
+  derived from `PROXYHUB_SECRET_KEY`. The installer provisions a stable
+  32-byte key into `/etc/proxy-hub/proxy-hub.env` (0600/640 root:proxyhub).
+- The application refuses to seal/open client passwords when no stable key
+  is configured instead of silently using an ephemeral process key (which
+  would create passwords no future process can open).
+- Backup the env file alongside the database (both 0600, never in Git).
+  Key loss = stored client passwords become unopenable; recovery is
+  re-creating/rotating device passwords, not decryption.
+- Key rotation (re-encryption) is NOT implemented: rotating the key without
+  re-creating passwords breaks `open_password`. Documented limitation —
+  fail safely, do not rotate silently.
+
 ## Threat model notes
 
 - The gateway listener (`0.0.0.0:8388/8389`) is authenticated-only; the admin

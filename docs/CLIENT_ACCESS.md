@@ -5,7 +5,7 @@ The public gateway speaks standard **SOCKS5** (port 8388) and **HTTP CONNECT**
 
 ## Connection parameters
 
-- Server: `194.60.231.172`
+- Server: `<server-ip>`
 - SOCKS5 port: `8388` · HTTP port: `8389`
 - Username/password: per-device credentials created in the panel
   (Devices & Access → + دستگاه جدید). The password is shown ONCE — copy it then.
@@ -17,14 +17,14 @@ can disable/rotate each independently.
 ## Windows 11
 
 Settings → Network & internet → Proxy → Manual proxy setup → Use a proxy server
-On. Address `194.60.231.172`, port `8389` (HTTP). Windows prompts for username +
+On. Address `<server-ip>`, port `8389` (HTTP). Windows prompts for username +
 password on first use. (For SOCKS-only apps, configure inside the app with port
 8388 and SOCKS5 type.)
 
 ## Android
 
 Wi-Fi → long-press network → Modify → Advanced → Proxy: Manual.
-Hostname `194.60.231.172`, port `8389`. Android 12+ may not ask for proxy auth
+Hostname `<server-ip>`, port `8389`. Android 12+ may not ask for proxy auth
 on all builds — if auth fails, use the app-level SOCKS5 setting (e.g. in
 Telegram: Settings → Data and Storage → Proxy → Add Proxy → SOCKS5,
 server/port/username/password).
@@ -32,18 +32,18 @@ server/port/username/password).
 ## iPhone / iPad
 
 Wi-Fi → (i) on the network → Configure Proxy → Manual. Server
-`194.60.231.172`, port `8389`, Authentication On with the device credentials.
+`<server-ip>`, port `8389`, Authentication On with the device credentials.
 
 ## macOS
 
 System Settings → Wi-Fi → Details… → Proxies. Enable “SOCKS proxy”
-(`194.60.231.172:8388`) and/or “Web proxy (HTTP)” (`:8389`) with username +
+(`<server-ip>:8388`) and/or “Web proxy (HTTP)” (`:8389`) with username +
 password. Or per-app (Telegram, browsers) proxy settings.
 
 ## Linux
 
 GNOME: Settings → Network → Proxy → Manual (SOCKS `…:8388`, HTTP `…:8389`).
-Terminal-only: `export HTTPS_PROXY=http://USER:PASS@194.60.231.172:8389` etc.
+Terminal-only: `export HTTPS_PROXY=http://USER:PASS@<server-ip>:8389` etc.
 (Per-session only — never system-wide on the VPS itself.)
 
 ## Behavior notes
