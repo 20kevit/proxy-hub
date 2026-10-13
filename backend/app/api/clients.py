@@ -4,7 +4,7 @@ from __future__ import annotations
 import io
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 
 from ..config import get_settings
@@ -37,6 +37,9 @@ def _public_client(c: ProxyClient) -> dict:
         "expires_at": c.expires_at.isoformat() if c.expires_at else None,
         "dedicated_port": c.dedicated_port,
         "max_connections": c.max_connections,
+        # Xray SOCKS inbounds expose no per-user connection cap, so this
+        # value is administrative metadata only and is NOT enforced.
+        "max_connections_enforced": False,
         "notes": c.notes or "",
         "last_used_at": c.last_used_at.isoformat() if c.last_used_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -185,7 +188,7 @@ def delete_client(client_id: int, user: str = Depends(current_user)):
 
 
 @router.get("/api/clients/{client_id}/qr.png")
-def client_qr(client_id: int, user: str = Depends(current_user)):
+def client_qr(client_id: int, request: Request, user: str = Depends(current_user)):
     """QR of a standard socks5://user:pass@host:port URI (no secrets in logs)."""
     try:
         import qrcode
@@ -201,7 +204,12 @@ def client_qr(client_id: int, user: str = Depends(current_user)):
             raise HTTPException(400, f"کلاینت قابل استفاده نیست: {why}")
         from ..services.failover import session_get
 
-        host = "194.60.231.172"
+        # Derive the public host from the request (works behind the
+        # reverse proxy and avoids hardcoding deployment addresses).
+        host = (request.headers.get("x-forwarded-host", "") or request.url.hostname or "")
+        host = host.split(",")[0].strip().split(":")[0]
+        if not host or any(c.isspace() for c in host) or "/" in host:
+            raise HTTPException(400, "cannot determine public host for QR")
         port = int(session_get(db, "public_socks_port",
                                str(get_settings().public_socks_port)))
         password = open_password(client.password_enc)

@@ -63,6 +63,15 @@ class SettingsIn(BaseModel):
     public_http_port: int | None = None
     default_route: str | None = None
 
+    from pydantic import field_validator as _fv2
+
+    @_fv2("health_url")
+    @classmethod
+    def _health_url_must_be_safe(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validated_http_url(v, field="health_url")
+
 
 class RouteRuleIn(BaseModel):
     priority: int = 100
@@ -103,6 +112,53 @@ class ClientUpdate(BaseModel):
     notes: str | None = None
 
 
+def _validated_http_url(value: str, field: str = "url") -> str:
+    """Validate an absolute http(s) URL; reject credentials, loopback and
+    cloud-metadata targets (SSRF defense for admin-supplied URLs)."""
+    from urllib.parse import urlparse
+
+    v = (value or "").strip()
+    if len(v) < 8 or len(v) > 2048:
+        raise ValueError(f"{field} must be 8..2048 characters")
+    try:
+        u = urlparse(v)
+    except Exception as exc:
+        raise ValueError(f"{field} is not a valid URL: {exc}") from exc
+    if u.scheme not in ("http", "https"):
+        raise ValueError(f"{field} scheme must be http or https")
+    host = (u.hostname or "").lower()
+    if not host:
+        raise ValueError(f"{field} must include a host")
+    if u.username or u.password:
+        raise ValueError(f"{field} must not embed credentials")
+    if host in ("localhost", "metadata.google.internal") or host.endswith(".localhost"):
+        raise ValueError(f"{field} host is not allowed")
+    try:
+        import ipaddress as _ip
+
+        ip = _ip.ip_address(host.strip("[]"))
+        if ip.is_loopback or ip.is_link_local or str(ip) == "169.254.169.254":
+            raise ValueError(f"{field} host is not allowed")
+    except ValueError as exc:
+        if "not allowed" in str(exc):
+            raise
+    return v
+
+
 class SubscriptionIn(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
-    update_interval: int | None = None
+    update_interval: int | None = Field(default=None, ge=300, le=2592000)
+
+    from pydantic import field_validator as _fv
+
+    @_fv("url")
+    @classmethod
+    def _url_must_be_safe(cls, v: str) -> str:
+        return _validated_http_url(v)
+
+
+class FailoverConfigIn(BaseModel):
+    mode: str | None = None
+    threshold: int | None = Field(default=None, ge=1, le=100)
+    cooldown: int | None = Field(default=None, ge=0, le=86400)
+    min_healthy: int | None = Field(default=None, ge=0, le=86400)

@@ -76,10 +76,22 @@ def make_password_hash(password: str) -> str:
 
 
 def _fernet() -> "Fernet":
+    import os as _os
+
     from ..config import get_settings
 
     if not _HAS_CRYPTO:
         raise RuntimeError("cryptography package is required for client passwords")
+    # Fail fast when no stable key is configured: deriving from an ephemeral
+    # process key would seal passwords that no future process can open.
+    # The installer provisions PROXYHUB_SECRET_KEY; key rotation (re-encryption
+    # of stored passwords) is NOT supported — treat the key as part of backups.
+    configured = (_os.getenv("PROXYHUB_SECRET_KEY", "") or "").strip()
+    if not configured:
+        raise RuntimeError(
+            "client credential store unavailable: PROXYHUB_SECRET_KEY is not "
+            "configured (see installer; restore it from backup, do not rotate "
+            "it without re-creating client passwords)")
     raw = hashlib.sha256(
         b"proxyhub-client-key-v1|" + get_settings().secret_key.encode()
     ).digest()

@@ -9,7 +9,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
+from sqlalchemy import Integer, case, func
 
 from ..models import AuditLog, ProbeTelemetry, ProxyNode
 from .deps import current_user, db_session
@@ -38,6 +38,30 @@ def _percentile(sorted_vals: list[float], pct: float) -> float | None:
     return round(sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f), 1)
 
 
+def _base_query(db, start, node_id: int = 0, probe_type: str = ""):
+    q = db.query(ProbeTelemetry).filter(ProbeTelemetry.created_at >= start.replace(tzinfo=None))
+    if node_id:
+        q = q.filter(ProbeTelemetry.node_id == node_id)
+    if probe_type:
+        q = q.filter(ProbeTelemetry.probe_type == probe_type)
+    return q
+
+
+def _latency_at_offset(db, start, pct: float, node_id: int = 0,
+                       probe_type: str = "") -> tuple[float | None, int]:
+    """Exact-ish percentile via ORDER BY + OFFSET (3 bounded queries, no full fetch)."""
+    base = _base_query(db, start, node_id, probe_type).filter(
+        ProbeTelemetry.ok.is_(True), ProbeTelemetry.latency_ms.isnot(None))
+    count = base.with_entities(func.count(ProbeTelemetry.id)).scalar() or 0
+    if not count:
+        return None, 0
+    offset = min(count - 1, int((count - 1) * (pct / 100.0)))
+    row = (base.with_entities(ProbeTelemetry.latency_ms)
+           .order_by(ProbeTelemetry.latency_ms.asc())
+           .offset(offset).limit(1).first())
+    return (round(row[0], 1) if row and row[0] is not None else None), count
+
+
 @router.get("/api/telemetry/summary")
 def telemetry_summary(hours: int = 24, node_id: int = 0, probe_type: str = "",
                       user: str = Depends(current_user)):
@@ -46,43 +70,43 @@ def telemetry_summary(hours: int = 24, node_id: int = 0, probe_type: str = "",
         raise HTTPException(400, "invalid probe_type")
     db = db_session()
     try:
-        q = db.query(ProbeTelemetry).filter(ProbeTelemetry.created_at >= start)
-        if node_id:
-            q = q.filter(ProbeTelemetry.node_id == node_id)
-        if probe_type:
-            q = q.filter(ProbeTelemetry.probe_type == probe_type)
-        rows = q.order_by(ProbeTelemetry.id.desc()).limit(20000).all()
-        total = len(rows)
-        ok_rows = [r for r in rows if r.ok]
-        ok_count = len(ok_rows)
-        lats = sorted([r.latency_ms for r in ok_rows if r.latency_ms is not None])
-        by_type: dict = {}
-        for r in rows:
-            b = by_type.setdefault(r.probe_type, {"total": 0, "ok": 0, "lat": []})
-            b["total"] += 1
-            if r.ok:
-                b["ok"] += 1
-                if r.latency_ms is not None:
-                    b["lat"].append(r.latency_ms)
+        # Exact totals via aggregate COUNT (correct at any dataset size).
+        total = _base_query(db, start, node_id, probe_type).with_entities(
+            func.count(ProbeTelemetry.id)).scalar() or 0
+        ok_count = _base_query(db, start, node_id, probe_type).filter(
+            ProbeTelemetry.ok.is_(True)).with_entities(
+            func.count(ProbeTelemetry.id)).scalar() or 0
+        p50, n_lat = _latency_at_offset(db, start, 50, node_id, probe_type)
+        p95, _ = _latency_at_offset(db, start, 95, node_id, probe_type)
+        p99, _ = _latency_at_offset(db, start, 99, node_id, probe_type)
         by_type_out = {}
-        for t, b in by_type.items():
-            sl = sorted(b["lat"])
+        for t, in db.query(ProbeTelemetry.probe_type).filter(
+                ProbeTelemetry.created_at >= start.replace(tzinfo=None)).distinct().all():
+            if probe_type and t != probe_type:
+                continue
+            bt = _base_query(db, start, node_id, t).with_entities(
+                func.count(ProbeTelemetry.id)).scalar() or 0
+            bo = _base_query(db, start, node_id, t).filter(
+                ProbeTelemetry.ok.is_(True)).with_entities(
+                func.count(ProbeTelemetry.id)).scalar() or 0
+            tp50, tn = _latency_at_offset(db, start, 50, node_id, t)
+            tp95, _ = _latency_at_offset(db, start, 95, node_id, t)
+            tp99, _ = _latency_at_offset(db, start, 99, node_id, t)
             by_type_out[t] = {
-                "total": b["total"], "ok": b["ok"],
-                "success_rate": round(b["ok"] / b["total"], 4) if b["total"] else None,
-                "p50": _percentile(sl, 50), "p95": _percentile(sl, 95),
-                "p99": _percentile(sl, 99), "samples": len(sl),
+                "total": bt, "ok": bo,
+                "success_rate": round(bo / bt, 4) if bt else None,
+                "p50": tp50, "p95": tp95, "p99": tp99, "samples": tn,
             }
         return {
             "window_hours": hours,
             "from": start.isoformat(), "to": now.isoformat(),
             "total": total, "ok": ok_count,
             "success_rate": round(ok_count / total, 4) if total else None,
-            "p50": _percentile(lats, 50), "p95": _percentile(lats, 95),
-            "p99": _percentile(lats, 99), "latency_samples": len(lats),
+            "p50": p50, "p95": p95, "p99": p99, "latency_samples": n_lat,
             "by_type": by_type_out,
-            "sufficient_for_percentiles": len(lats) >= 20,
-            "note": "percentiles require >=20 latency samples; App-level (deep) probes measure end-to-end HTTPS egress",
+            "sufficient_for_percentiles": n_lat >= 20,
+            "note": "totals are exact DB counts; percentiles via ordered offsets; "
+                    "deep probes measure end-to-end HTTPS egress",
         }
     finally:
         db.close()
@@ -91,7 +115,7 @@ def telemetry_summary(hours: int = 24, node_id: int = 0, probe_type: str = "",
 @router.get("/api/telemetry/series")
 def telemetry_series(hours: int = 24, node_id: int = 0, probe_type: str = "",
                      bucket_minutes: int = 60, limit: int = 200,
-                     user: str = Depends(current_user)):
+                     before_id: int = 0, user: str = Depends(current_user)):
     start, now = _parse_window(hours)
     if probe_type and probe_type not in ALLOWED_PROBE_TYPES:
         raise HTTPException(400, "invalid probe_type")
@@ -100,40 +124,43 @@ def telemetry_series(hours: int = 24, node_id: int = 0, probe_type: str = "",
     limit = max(1, min(limit, MAX_LIMIT))
     db = db_session()
     try:
-        q = db.query(ProbeTelemetry).filter(ProbeTelemetry.created_at >= start)
+        # Database-side bucketing: one GROUP BY query regardless of dataset size.
+        # Buckets with zero rows are absent (missing data is never fabricated).
+        secs = bucket_minutes * 60
+        ok_latency = case((ProbeTelemetry.ok.is_(True), ProbeTelemetry.latency_ms),
+                          else_=None)
+        bucket = func.datetime(
+            (func.strftime("%s", ProbeTelemetry.created_at) / secs).cast(Integer) * secs,
+            "unixepoch")
+        bq = db.query(
+            bucket.label("bucket"),
+            func.count(ProbeTelemetry.id).label("total"),
+            func.sum(func.cast(ProbeTelemetry.ok, Integer)).label("ok"),
+            func.avg(ok_latency).label("avg_latency"),
+            func.max(ok_latency).label("max_latency"),
+            func.count(case((ok_latency.isnot(None), 1), else_=None)).label("samples"),
+        ).filter(ProbeTelemetry.created_at >= start.replace(tzinfo=None))
         if node_id:
-            q = q.filter(ProbeTelemetry.node_id == node_id)
+            bq = bq.filter(ProbeTelemetry.node_id == node_id)
         if probe_type:
-            q = q.filter(ProbeTelemetry.probe_type == probe_type)
-        rows = q.order_by(ProbeTelemetry.created_at.asc()).limit(20000).all()
-        buckets: dict[str, dict] = {}
-        for r in rows:
-            ts = r.created_at
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            bkey = ts.replace(minute=(ts.minute // bucket_minutes) * bucket_minutes,
-                              second=0, microsecond=0).isoformat()
-            b = buckets.setdefault(bkey, {"total": 0, "ok": 0, "lat": []})
-            b["total"] += 1
-            if r.ok:
-                b["ok"] += 1
-                if r.latency_ms is not None:
-                    b["lat"].append(r.latency_ms)
+            bq = bq.filter(ProbeTelemetry.probe_type == probe_type)
         series = []
-        for bkey in sorted(buckets):
-            b = buckets[bkey]
-            sl = sorted(b["lat"])
+        for bkey, total, okc, avg_lat, max_lat, samples in bq.group_by(bucket).order_by(bucket).all():
+            okc = int(okc or 0)
+            # SQLite returns "YYYY-MM-DD HH:MM:SS"; emit strict ISO-8601 UTC.
+            iso_bucket = bkey.replace(" ", "T") + "+00:00" if bkey else bkey
             series.append({
-                "bucket": bkey, "total": b["total"], "ok": b["ok"],
-                "success_rate": round(b["ok"] / b["total"], 4) if b["total"] else None,
-                "p50": _percentile(sl, 50), "p95": _percentile(sl, 95), "samples": len(sl),
+                "bucket": iso_bucket,
+                "total": total, "ok": okc,
+                "success_rate": round(okc / total, 4) if total else None,
+                "avg_latency": round(avg_lat, 1) if avg_lat is not None else None,
+                "max_latency": round(max_lat, 1) if max_lat is not None else None,
+                "samples": samples,
             })
-        # Paginated raw rows (newest first)
-        q2 = db.query(ProbeTelemetry).filter(ProbeTelemetry.created_at >= start)
-        if node_id:
-            q2 = q2.filter(ProbeTelemetry.node_id == node_id)
-        if probe_type:
-            q2 = q2.filter(ProbeTelemetry.probe_type == probe_type)
+        # Keyset-paginated raw rows (newest first; before_id for stable paging).
+        q2 = _base_query(db, start, node_id, probe_type)
+        if before_id:
+            q2 = q2.filter(ProbeTelemetry.id < before_id)
         raw = q2.order_by(ProbeTelemetry.id.desc()).limit(limit).all()
         id2name = {n.id: n.name for n in db.query(ProxyNode).all()}
         return {
@@ -227,11 +254,9 @@ def report_summary(hours: int = 48, user: str = Depends(current_user)):
         deep_ok = db.query(func.count(ProbeTelemetry.id)).filter(
             ProbeTelemetry.created_at >= start, ProbeTelemetry.probe_type == "deep",
             ProbeTelemetry.ok.is_(True)).scalar() or 0
-        lats = [r[0] for r in db.query(ProbeTelemetry.latency_ms).filter(
-            ProbeTelemetry.created_at >= start, ProbeTelemetry.probe_type == "deep",
-            ProbeTelemetry.ok.is_(True), ProbeTelemetry.latency_ms.isnot(None)
-        ).order_by(ProbeTelemetry.id.desc()).limit(5000).all()]
-        sl = sorted(lats)
+        deep_p50, deep_n = _latency_at_offset(db, start, 50, 0, "deep")
+        deep_p95, _ = _latency_at_offset(db, start, 95, 0, "deep")
+        deep_p99, _ = _latency_at_offset(db, start, 99, 0, "deep")
         fails = db.query(AuditLog).filter(
             AuditLog.created_at >= start,
             AuditLog.action == "node.activate").order_by(AuditLog.id.desc()).limit(100).all()
@@ -249,9 +274,9 @@ def report_summary(hours: int = 48, user: str = Depends(current_user)):
                 "success_rate": round(okc / total, 4) if total else None,
                 "deep_total": deep_total, "deep_ok": deep_ok,
                 "deep_success_rate": round(deep_ok / deep_total, 4) if deep_total else None,
-                "deep_p50": _percentile(sl, 50), "deep_p95": _percentile(sl, 95),
-                "deep_p99": _percentile(sl, 99), "deep_samples": len(sl),
-                "sufficient_for_percentiles": len(sl) >= 20,
+                "deep_p50": deep_p50, "deep_p95": deep_p95,
+                "deep_p99": deep_p99, "deep_samples": deep_n,
+                "sufficient_for_percentiles": deep_n >= 20,
                 "first_record": first_tel.isoformat() if first_tel else None,
                 "last_record": last_tel.isoformat() if last_tel else None,
             },

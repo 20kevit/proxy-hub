@@ -23,10 +23,12 @@ def get_subscription(user: str = Depends(current_user)):
     import json as _json
     from datetime import timedelta
 
+    from ..services.subscription import get_effective_url
+
     db = db_session()
     try:
         sub = db.query(SubscriptionState).first()
-        url = get_settings().subscription_url
+        url = get_effective_url(db)
         interval = int(session_get(db, "sub_update_interval", str(get_settings().sub_update_interval)))
         try:
             stats = _json.loads(session_get(db, "last_sub_stats", "{}"))
@@ -55,35 +57,14 @@ def get_subscription(user: str = Depends(current_user)):
 
 @router.put("/api/subscription")
 def put_subscription(payload: SubscriptionIn, user: str = Depends(current_user)):
-    # Persist URL to /etc/proxy-hub/proxy-hub.env (outside Git) — never in DB/logs.
-    from pathlib import Path
+    # Persist URL in the settings table (least privilege: the web process
+    # cannot write the root-owned env file, and must not weaken its mode).
+    # /etc/proxy-hub/proxy-hub.env remains the bootstrap default only.
+    from ..services.subscription import set_subscription_url
 
-    env_path = Path("/etc/proxy-hub/proxy-hub.env")
-    try:
-        lines = env_path.read_text().splitlines() if env_path.exists() else []
-    except OSError as exc:
-        raise HTTPException(500, f"cannot read env file: {exc}")
-    found = False
-    out = []
-    for line in lines:
-        if line.strip().startswith("PROXYHUB_SUBSCRIPTION_URL="):
-            out.append(f"PROXYHUB_SUBSCRIPTION_URL={payload.url}")
-            found = True
-        else:
-            out.append(line)
-    if not found:
-        out.append(f"PROXYHUB_SUBSCRIPTION_URL={payload.url}")
-    try:
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        env_path.write_text("\n".join(out) + "\n")
-    except OSError as exc:
-        raise HTTPException(500, f"cannot write env file: {exc}")
-    import os as _os
-    _os.environ["PROXYHUB_SUBSCRIPTION_URL"] = payload.url
-    from ..config import refresh_settings as _refresh
-    _refresh()
     db = db_session()
     try:
+        set_subscription_url(db, payload.url)
         if payload.update_interval:
             session_set(db, "sub_update_interval", str(payload.update_interval))
         _audit(db, user, "subscription.configure", mask_url(payload.url))

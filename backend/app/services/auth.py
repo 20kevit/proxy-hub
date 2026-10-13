@@ -35,24 +35,79 @@ def _sign(data: str) -> str:
     return hmac.new(key, data.encode(), hashlib.sha256).hexdigest()
 
 
-def create_session(username: str) -> str:
+def create_session(username: str, session_version: int = 0) -> str:
     expiry = int(time.time()) + SESSION_TTL
     nonce = secrets.token_hex(12)
-    payload = f"{username}.{expiry}.{nonce}"
+    payload = f"{username}.{expiry}.{nonce}.{int(session_version)}"
     return f"{payload}.{_sign(payload)}"
 
 
-def parse_session(token: str) -> str | None:
+def _split_session(token: str) -> tuple[str, int, int] | None:
+    """Return (username, expiry, version) after verifying signature and expiry.
+
+    Accepts legacy 4-part tokens (treated as version 0) and current 5-part
+    tokens. Returns None on any failure. Never raises.
+    """
     try:
-        username, expiry, nonce, sig = token.split(".")
-        payload = f"{username}.{expiry}.{nonce}"
+        parts = token.split(".")
+        if len(parts) == 5:
+            username, expiry, nonce, version, sig = parts
+            payload = f"{username}.{expiry}.{nonce}.{version}"
+            version_i = int(version)
+        elif len(parts) == 4:
+            username, expiry, nonce, sig = parts
+            payload = f"{username}.{expiry}.{nonce}"
+            version_i = 0
+        else:
+            return None
         if not hmac.compare_digest(_sign(payload), sig):
             return None
         if int(expiry) < time.time():
             return None
-        return username
+        return username, int(expiry), version_i
     except Exception:
         return None
+
+
+def parse_session(token: str) -> str | None:
+    """Stateless check (signature + expiry only). Prefer parse_session_verified."""
+    parsed = _split_session(token)
+    return parsed[0] if parsed else None
+
+
+def parse_session_verified(token: str, session) -> str | None:
+    """Full check: signature + expiry + server-side session version.
+
+    Returns the username only when the token's version matches the user's
+    current session_version in the database (logout / password change bump it).
+    """
+    from ..models import User
+
+    parsed = _split_session(token)
+    if not parsed:
+        return None
+    username, _expiry, version = parsed
+    try:
+        row = session.query(User).filter(User.username == username).first()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    if int(row.session_version or 0) != int(version):
+        return None
+    return username
+
+
+def bump_session_version(session, username: str) -> int:
+    """Revoke all existing tokens for a user. Returns the new version."""
+    from ..models import User
+
+    row = session.query(User).filter(User.username == username).first()
+    if row is None:
+        return 0
+    row.session_version = int(row.session_version or 0) + 1
+    session.commit()
+    return row.session_version
 
 
 def new_csrf() -> str:

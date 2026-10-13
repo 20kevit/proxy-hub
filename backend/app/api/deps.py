@@ -13,7 +13,16 @@ def db_session() -> Session:
 
 
 def current_user(request: Request, ph_session: str | None = Cookie(default=None)) -> str:
-    user = parse_session(ph_session or "")
+    from ..services.auth import parse_session_verified
+
+    token = ph_session or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    db = db_session()
+    try:
+        user = parse_session_verified(token, db)
+    finally:
+        db.close()
     if not user:
         raise HTTPException(status_code=401, detail="unauthenticated")
     return user
@@ -28,10 +37,11 @@ def check_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail="bad csrf token")
 
 
-def set_auth_cookies(response: Response, username: str, secure: bool = False) -> str:
+def set_auth_cookies(response: Response, username: str, secure: bool = False,
+                     session_version: int = 0) -> str:
     from ..services.auth import create_session
 
-    token = create_session(username)
+    token = create_session(username, session_version=session_version)
     response.set_cookie(
         "ph_session", token, httponly=True, samesite="lax", secure=secure,
         path="/", max_age=12 * 3600,

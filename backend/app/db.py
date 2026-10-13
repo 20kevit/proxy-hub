@@ -33,19 +33,18 @@ def get_session_factory():
 
 def init_db() -> None:
     from . import models  # noqa: F401  (register tables)
+    from .migrations import SCHEMA_VERSION, current_version, migrate
 
     Base.metadata.create_all(get_engine())
-    # Lightweight additive migration for existing DBs (no alembic yet).
-    import sqlalchemy as _sa
-
     with get_engine().begin() as conn:
-        cols = {c["name"] for c in _sa.inspect(conn).get_columns("proxy_nodes")}
-        if "egress_ok" not in cols:
-            conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN egress_ok BOOLEAN DEFAULT 0"))
-        if "last_success" not in cols:
-            conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN last_success DATETIME"))
-        if "success_count" not in cols:
-            conn.execute(_sa.text("ALTER TABLE proxy_nodes ADD COLUMN success_count INTEGER DEFAULT 0"))
+        before = current_version(conn)
+        after = migrate(conn)
+        if after != before:
+            import logging as _logging
+
+            _logging.getLogger("proxyhub.db").info(
+                "schema migrated v%d -> v%d (target v%d)", before, after, SCHEMA_VERSION
+            )
 
 
 def reset_engine() -> None:

@@ -13,7 +13,7 @@ import os
 from app.config import get_settings
 from app.db import get_session_factory, init_db
 from app.models import User
-from app.services.auth import hash_password
+from app.services.auth import bump_session_version, hash_password
 
 init_db()
 db = get_session_factory()()
@@ -25,7 +25,9 @@ try:
         print("admin created")
     else:
         u.password_hash = hash_password(os.environ["PROXYHUB_ADMIN_PASSWORD"])
-        print("admin password updated")
+        # Revoke all existing sessions issued before this password change.
+        u.session_version = int(u.session_version or 0) + 1
+        print("admin password updated (sessions revoked)")
     db.commit()
 finally:
     db.close()

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..config import get_settings
 from ..models import AuditLog, RoutingRule
-from ..schemas import RoutingRuleIn, SettingsIn
+from ..schemas import FailoverConfigIn, RoutingRuleIn, SettingsIn
 from ..services.failover import session_get, session_set, get_failover_config, set_failover_config
 from ..services.lifecycle import lifecycle_manager
 from ..services.routing import ensure_defaults, ordered_rules, proxy_env_snippet
@@ -195,10 +195,17 @@ def get_failover_config_api(user: str = Depends(current_user)):
 
 
 @router.put("/api/failover/config")
-def put_failover_config_api(payload: dict, user: str = Depends(current_user)):
+def put_failover_config_api(payload: FailoverConfigIn, user: str = Depends(current_user)):
     db = db_session()
     try:
-        return set_failover_config(db, **payload)
+        data = payload.model_dump(exclude_unset=True)
+        allowed = {"mode": "failover_mode", "threshold": "failover_threshold",
+                   "cooldown": "failover_cooldown", "min_healthy": "failover_min_healthy"}
+        try:
+            return set_failover_config(
+                db, **{allowed[k]: v for k, v in data.items() if k in allowed})
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
     finally:
         db.close()
 

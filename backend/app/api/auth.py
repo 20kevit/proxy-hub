@@ -34,7 +34,8 @@ def login(payload: dict, request: Request, response: Response):
             raise HTTPException(status_code=401, detail="invalid credentials")
         fwd = request.headers.get("x-forwarded-proto", "")
         is_https = request.url.scheme == "https" or fwd.split(",")[0].strip().lower() == "https"
-        csrf = set_auth_cookies(response, username, secure=is_https)
+        csrf = set_auth_cookies(response, username, secure=is_https,
+                                session_version=int(user.session_version or 0))
         _audit(db, username, "login.ok")
         return {"ok": True, "csrf": csrf, "username": username}
     finally:
@@ -46,6 +47,9 @@ def logout(response: Response, user: str = Depends(current_user)):
     response.delete_cookie("ph_session", path="/")
     db = db_session()
     try:
+        from ..services.auth import bump_session_version
+
+        bump_session_version(db, user)
         _audit(db, user, "logout")
     finally:
         db.close()
