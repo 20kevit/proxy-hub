@@ -303,10 +303,6 @@ class HealthEngineV2:
             
             now_utc = datetime.now(timezone.utc)
             for node in nodes:
-                if not uses_tcp_transport(node):
-                    # UDP/QUIC transports answer no TCP dial: skip rather than
-                    # fabricate failures; egress is verified in the deep loop.
-                    continue
                 try:
                     if node.circuit_open and node.circuit_open_until:
                         circuit_until = node.circuit_open_until
@@ -315,8 +311,17 @@ class HealthEngineV2:
                         if now_utc < circuit_until:
                             continue
                         else:
+                            # Breaker expired: reopen for probing regardless of
+                            # transport (UDP nodes never reach the TCP probe
+                            # below, so this must not be skipped for them).
                             node.circuit_open = False
                             node.circuit_open_until = None
+                            db.commit()
+                    if not uses_tcp_transport(node):
+                        # UDP/QUIC transports answer no TCP dial: skip the
+                        # probe rather than fabricate failures; egress is
+                        # verified in the deep loop.
+                        continue
 
                     result = tcp_probe(node.server, node.port, timeout=2.0)
                     self._update_fast_metrics(db, node, result)

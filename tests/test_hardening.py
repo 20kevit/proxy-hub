@@ -901,3 +901,229 @@ def test_udp_transport_skipped_in_fast_loop(db, monkeypatch):
     monkeypatch.setattr(hv, "tcp_probe", spy)
     hv.HealthEngineV2()._fast_check_all_sync()
     assert probed == ["x.ir"]  # exactly one TCP probe: the TCP node
+
+
+# --- Ephemeral verifier failure-path cleanup (both cores) ----------------------
+
+def _vless_node(**kw):
+    from app.models import ProxyNode
+    base = dict(fingerprint="fp-vx", name="VX", protocol="vless",
+                server="s.ir", port=443, secret="u", params={})
+    base.update(kw)
+    return ProxyNode(**base)
+
+
+def _patch_ephemeral_env(monkeypatch, tmp_path):
+    import shutil as _shutil
+    from app.services import cores as C
+
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.SingBoxAdapter, "installed", lambda self: True)
+    monkeypatch.setattr(_shutil, "which", lambda *a, **k: "/fake/bin")
+
+    class _Ok:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Ok())
+    return C
+
+
+def _ephemeral_cases():
+    from app.services import cores as C
+    return [
+        ("xray", C.EphemeralXray, _vless_node(), "verify-"),
+        ("sing-box", C.EphemeralSingBox, _hy2_node(), "verify-sb-"),
+    ]
+
+
+def _glob_prefix(tmp_path, prefix):
+    return list(tmp_path.glob(prefix + "*.json"))
+
+
+def test_ephemeral_validator_timeout_cleans_up(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    _patch_ephemeral_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            _sp.TimeoutExpired(cmd=a[0], timeout=30)))
+    import pytest
+    for label, cls, node, prefix in _ephemeral_cases():
+        with pytest.raises(C.CoreError, match="verify validation failed"):
+            with cls(node):
+                pass
+        assert _glob_prefix(tmp_path, prefix) == [], label
+
+
+def test_ephemeral_validator_oserror_cleans_up(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    _patch_ephemeral_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(_sp, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError("disk gone")))
+    import pytest
+    for label, cls, node, prefix in _ephemeral_cases():
+        with pytest.raises(C.CoreError, match="verify validation failed"):
+            with cls(node):
+                pass
+        assert _glob_prefix(tmp_path, prefix) == [], label
+
+
+def test_ephemeral_spawn_failure_cleans_up(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    _patch_ephemeral_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(_sp, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            FileNotFoundError("binary vanished")))
+    import pytest
+    for label, cls, node, prefix in _ephemeral_cases():
+        with pytest.raises(C.CoreError, match="failed to start"):
+            with cls(node):
+                pass
+        assert _glob_prefix(tmp_path, prefix) == [], label
+
+
+def test_ephemeral_readiness_timeout_reaps_process(monkeypatch, tmp_path):
+    import socket as _socket
+    import subprocess as _sp
+    import time as _time
+    from app.services import cores as C
+
+    _patch_ephemeral_env(monkeypatch, tmp_path)
+    procs = []
+    monkeypatch.setattr(_sp, "Popen",
+                        lambda *a, **k: procs.append(_FakeProc()) or procs[-1])
+    monkeypatch.setattr(_socket, "create_connection",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError("nothing listening")))
+    # Fast-forward the readiness clock; keep real sleeps out of the test.
+    tick = {"t": 1000.0}
+
+    def _mono():
+        tick["t"] += 10.0
+        return tick["t"]
+
+    monkeypatch.setattr(_time, "monotonic", _mono)
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+    import pytest
+    for label, cls, node, prefix in _ephemeral_cases():
+        procs.clear()
+        with pytest.raises(C.CoreError, match="did not listen in time"):
+            with cls(node):
+                pass
+        assert len(procs) == 1, label
+        assert procs[0].terminated is True, label  # reaped, not orphaned
+        assert _glob_prefix(tmp_path, prefix) == [], label
+
+
+def test_hy2_poisoned_node_recovers_on_genuine_success(db, monkeypatch):
+    """A hy2 node stuck unhealthy (incl. expired circuit) must recover once a
+    genuine egress check succeeds — and must NOT recover on 'unverified'."""
+    from datetime import timedelta
+    from app.services import health_v2 as hv
+
+    n = _mk(db, "hy2-poisoned")
+    n.protocol = "hysteria2"
+    n.transport = "udp"
+    n.health = "unhealthy"
+    n.egress_ok = False
+    n.consecutive_failures = 12
+    n.consecutive_successes = 0
+    n.circuit_open = True
+    n.circuit_open_until = datetime.now(timezone.utc) - timedelta(seconds=5)
+    n.quality_score = 5.0
+    db.commit()
+    nid = n.id
+
+    # 1) verifier unavailable -> state untouched, still ineligible.
+    monkeypatch.setattr(
+        "app.services.cores.verify_node_egress",
+        lambda node, url, timeout=15: type("R", (), {
+            "ok": False, "app_latency_ms": None,
+            "error": "sing-box is not installed", "error_type": "unverified"})())
+    hv.HealthEngineV2()._deep_check_all_sync()
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == nid).first()
+    assert row.health == "unhealthy" and row.egress_ok is False
+    assert row.consecutive_failures == 12
+    from app.services.failover import eligible_candidates
+    cands, _ = eligible_candidates(db, exclude_id=None)
+    assert all(c.id != nid for c in cands)
+
+    # 2) verifier available, genuine success -> full recovery + eligible.
+    # Realistic sequence: the fast loop clears the expired breaker first
+    # (no TCP probe is wasted on the UDP transport), then the deep loop
+    # verifies egress genuinely.
+    monkeypatch.setattr(
+        "app.services.cores.verify_node_egress",
+        lambda node, url, timeout=15: type("R", (), {
+            "ok": True, "app_latency_ms": 180.0,
+            "error": "", "error_type": ""})())
+    hv.HealthEngineV2()._fast_check_all_sync()
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == nid).first()
+    assert row.circuit_open is False  # expired breaker reopened for probing
+    hv.HealthEngineV2()._deep_check_all_sync()
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == nid).first()
+    assert row.health == "healthy"
+    assert row.egress_ok is True
+    assert row.consecutive_failures == 0
+    assert row.last_success is not None
+    cands, _ = eligible_candidates(db, exclude_id=None)
+    assert any(c.id == nid for c in cands)
+
+
+# --- API boundaries: scoped rules, subscription URL, expiry --------------------
+
+def test_api_rejects_scoped_rule_without_dedicated_port():
+    from test_api import _client_with_admin as _cwa
+    from app.services import auth as _auth
+
+    _auth._attempts.clear()
+    from test_api import _login
+    c = _login(_cwa())
+    body = {"priority": 50, "match_type": "domain_exact", "pattern": "x.example.com",
+            "port": "", "network": "any", "action": "proxy", "client_scope": "ghost",
+            "enabled": True, "note": ""}
+    assert c.post("/api/rules", json=body).status_code == 400
+
+
+def test_api_subscription_url_stored_masked():
+    from test_api import _client_with_admin as _cwa
+    from app.services import auth as _auth
+
+    _auth._attempts.clear()
+    from test_api import _login
+    c = _login(_cwa())
+    bad = c.put("/api/subscription", json={"url": "http://169.254.169.254/x"})
+    assert bad.status_code == 422
+    good_url = "https://provider.example.com/sub/0123456789abcdef-token"
+    r = c.put("/api/subscription", json={"url": good_url})
+    assert r.status_code == 200, r.text
+    assert good_url not in r.text  # masked in response
+    got = c.get("/api/subscription").json()
+    assert good_url not in str(got)
+    assert "url_masked" in got
+
+
+def test_session_expiry_rejected():
+    import time as _time
+    from app.services import auth as _auth
+
+    past = int(_time.time()) - 10
+    import hashlib as _h
+    import hmac as _m
+    from app.config import get_settings
+
+    payload = f"admin.{past}.nonce123.0"
+    sig = _m.new(get_settings().secret_key.encode(), payload.encode(),
+                 _h.sha256).hexdigest()
+    assert _auth.parse_session(f"{payload}.{sig}") is None

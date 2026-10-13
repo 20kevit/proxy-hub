@@ -741,20 +741,30 @@ class EphemeralXray:
             except OSError:
                 pass
             raise
-        check = subprocess.run(
-            [settings.xray_bin, "run", "-test", "-config", tmp],
-            capture_output=True, text=True, timeout=30,
-        )
-        if check.returncode != 0:
-            self._cleanup()
-            raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
-        self._proc = subprocess.Popen(
-            [settings.xray_bin, "run", "-config", tmp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        # Everything below runs under one cleanup guard: any failure after
+        # the temp file exists (validator timeout/error, spawn failure,
+        # readiness timeout) removes the file, reaps a partial process and
+        # surfaces a CoreError — never a raw OSError/subprocess exception
+        # and never a leaked temp file.
         try:
+            try:
+                check = subprocess.run(
+                    [settings.xray_bin, "run", "-test", "-config", tmp],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise CoreError(f"verify validation failed: {type(exc).__name__}")
+            if check.returncode != 0:
+                raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
+            try:
+                self._proc = subprocess.Popen(
+                    [settings.xray_bin, "run", "-config", tmp],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                raise CoreError(f"verify xray failed to start: {type(exc).__name__}")
             return _wait_for_port(self._proc, self.port, "xray")
-        except CoreError:
+        except Exception:
             self._cleanup()
             raise
 
@@ -868,20 +878,29 @@ class EphemeralSingBox:
             except OSError:
                 pass
             raise
-        check = subprocess.run(
-            [settings.singbox_bin, "check", "-c", tmp],
-            capture_output=True, text=True, timeout=30,
-        )
-        if check.returncode != 0:
-            self._cleanup()
-            raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
-        self._proc = subprocess.Popen(
-            [settings.singbox_bin, "run", "-c", tmp],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        # Single cleanup guard: any failure after the temp file exists
+        # (validator timeout/error, spawn failure, readiness timeout)
+        # removes the file, reaps a partial process and surfaces a
+        # CoreError — never a raw OSError/subprocess exception.
         try:
+            try:
+                check = subprocess.run(
+                    [settings.singbox_bin, "check", "-c", tmp],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise CoreError(f"verify validation failed: {type(exc).__name__}")
+            if check.returncode != 0:
+                raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
+            try:
+                self._proc = subprocess.Popen(
+                    [settings.singbox_bin, "run", "-c", tmp],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                raise CoreError(f"verify sing-box failed to start: {type(exc).__name__}")
             return _wait_for_port(self._proc, self.port, "sing-box")
-        except CoreError:
+        except Exception:
             self._cleanup()
             raise
 

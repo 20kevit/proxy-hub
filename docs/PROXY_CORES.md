@@ -47,6 +47,14 @@ systemctl daemon-reload
 
 - Activating a `hysteria2` node without sing-box fails with a clear message
   pointing at the System page (no silent fallback).
+- Health semantics: Hysteria2 egress is verified through an isolated
+  ephemeral sing-box instance (never through the active proxy). While
+  sing-box is not installed, hy2 checks report `unverified` — this is not
+  evidence of health, so such nodes stay ineligible for failover/rotation
+  and their counters are left untouched. Recovery path: install sing-box;
+  the next deep cycle verifies the node genuinely and it becomes eligible
+  again (no manual reset needed; expired circuit breakers reopen
+  automatically).
 
 ## Public client listener (laptop/phone — explicit operator step)
 
