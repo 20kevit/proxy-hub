@@ -16,6 +16,9 @@
     <button data-tab="devices">دستگاه‌ها و دسترسی</button>
     <button data-tab="sub">اشتراک</button>
     <button data-tab="health">سلامت</button>
+    <button data-tab="lifecycle">چرخه حیات</button>
+    <button data-tab="telemetry">تلمتری</button>
+    <button data-tab="connections">اتصالات</button>
     <button data-tab="logs">گزارش‌ها</button>
     <button data-tab="system">سیستم</button>
     <button data-tab="settings">تنظیمات</button>
@@ -111,7 +114,40 @@
     </section>
 
     <section id="tab-health" class="tab hidden">
+      <div class="card"><h3>دوره‌های سلامت (Health Cycles)</h3><div id="healthCycles"></div></div>
       <div class="card"><h3>وضعیت سلامت نودها</h3><div id="healthList"></div></div>
+    </section>
+
+    <section id="tab-lifecycle" class="tab hidden">
+      <div class="card"><h3>وضعیت چرخه حیات</h3><div id="lifecycleStatus"></div></div>
+      <div class="card"><h3>چرخش دستی</h3>
+        <p class="muted">چرخش دستی فقط به نود سالم واجدشرایط انجام می‌شود. خرابی واقعی همیشه بر برنامه زمان‌بندی اولویت دارد.</p>
+        <div class="row"><button id="rotateBtn">چرخش کنترل‌شده اکنون</button></div>
+        <p id="rotateMsg" class="muted"></p>
+      </div>
+      <div class="card"><h3>تاریخچه چرخش‌ها و failoverها</h3><div id="rotationHistory"></div></div>
+    </section>
+
+    <section id="tab-telemetry" class="tab hidden">
+      <div class="card"><h3>فیلترها</h3><div class="row">
+        <select id="telNode"><option value="">همه نودها</option></select>
+        <select id="telType"><option value="">همه انواع</option><option value="fast">Fast (TCP)</option><option value="active">Active (TLS/HTTP)</option><option value="deep">Deep (HTTPS Egress)</option></select>
+        <select id="telOutcome"><option value="">همه نتایج</option><option value="success">موفق</option><option value="failed">ناموفق</option></select>
+        <select id="telHours"><option value="1">۱ ساعت اخیر</option><option value="6">۶ ساعت اخیر</option><option value="24" selected>۲۴ ساعت اخیر</option><option value="48">۴۸ ساعت اخیر</option></select>
+        <button id="telFilterBtn" class="primary">اعمال</button>
+      </div></div>
+      <div class="card"><h3>خلاصه تلمتری</h3><div id="telSummary"></div></div>
+      <div class="card"><h3>نمودار تأخیر (میانگین هر بازه)</h3><canvas id="telLatencyChart" width="600" height="220"></canvas><p class="muted" id="telLatencyNote"></p></div>
+      <div class="card"><h3>نرخ موفقیت در طول زمان</h3><canvas id="telSuccessChart" width="600" height="220"></canvas></div>
+      <div class="card"><h3>جدول تلمتری</h3><div class="tablewrap"><table id="telTable"><thead><tr><th>زمان</th><th>نود</th><th>نوع</th><th>نتیجه</th><th>تأخیر (ms)</th><th>خطا</th></tr></thead><tbody></tbody></table></div></div>
+    </section>
+
+    <section id="tab-connections" class="tab hidden">
+      <div class="card"><h3>اتصالات اخیر Xray</h3>
+        <p class="muted">منبع: لاگ journal سرویس proxyhub-xray + وضعیت شنونده‌ها. این نما IP:پورت کلاینت، مقصد و تگ inbound/outbound را نشان می‌دهد و هیچ انتساب process-level ادعا نمی‌کند.</p>
+        <div id="connInfo"></div>
+      </div>
+      <div class="card"><h3>اتصالات فعلی و اخیر</h3><div class="tablewrap"><table id="connTable"><thead><tr><th>زمان</th><th>کلاینت</th><th>مقصد</th><th>پورت</th><th>inbound</th><th>outbound</th></tr></thead><tbody></tbody></table></div></div>
     </section>
 
     <section id="tab-logs" class="tab hidden">

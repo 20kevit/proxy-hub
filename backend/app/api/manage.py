@@ -156,6 +156,16 @@ def put_settings(payload: SettingsIn, user: str = Depends(current_user)):
                     value = int(value)
                     if not 1024 <= value <= 65535:
                         raise HTTPException(400, "port out of range 1024-65535")
+                if key in ("sub_update_interval", "health_interval", "active_probe_interval",
+                           "deep_probe_interval", "health_timeout", "failover_threshold",
+                           "failover_cooldown", "failover_min_healthy", "rotation_check_interval"):
+                    value = int(value)
+                    if not 1 <= value <= 86400:
+                        raise HTTPException(400, f"{key} out of range 1..86400")
+                if key in ("rotation_max_duration_hours", "rotation_exclusion_hours"):
+                    value = int(value)
+                    if not 1 <= value <= 168:
+                        raise HTTPException(400, f"{key} out of range 1..168")
                 if key in ("gateway_enabled", "gateway_bind", "public_socks_port",
                            "public_http_port", "default_route"):
                     gw_changed = True

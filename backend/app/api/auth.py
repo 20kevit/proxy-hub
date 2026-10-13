@@ -26,13 +26,15 @@ def login(payload: dict, request: Request, response: Response):
     db = db_session()
     try:
         username = str(payload.get("username", "")).strip()[:64]
-        password = str(payload.get("password", ""))
+        password = str(payload.get("password", ""))[:256]
         user = db.query(User).filter(User.username == username).first()
         if user is None or not verify_password(password, user.password_hash):
             _audit(db, username or ip, "login.failed")
             from fastapi import HTTPException
             raise HTTPException(status_code=401, detail="invalid credentials")
-        csrf = set_auth_cookies(response, username)
+        fwd = request.headers.get("x-forwarded-proto", "")
+        is_https = request.url.scheme == "https" or fwd.split(",")[0].strip().lower() == "https"
+        csrf = set_auth_cookies(response, username, secure=is_https)
         _audit(db, username, "login.ok")
         return {"ok": True, "csrf": csrf, "username": username}
     finally:

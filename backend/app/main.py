@@ -18,6 +18,7 @@ from .api import nodes as nodes_api
 from .api import rules as rules_api
 from .api import subscription as sub_api
 from .api import system as system_api
+from .api import telemetry as telemetry_api
 from .api.deps import current_user
 from .config import get_settings
 from .db import get_session_factory, init_db
@@ -183,7 +184,15 @@ async def csrf_middleware(request: Request, call_next):
         cookie = request.cookies.get("ph_csrf", "")
         if not header or not cookie or header != cookie:
             return JSONResponse(status_code=403, content={"detail": "bad csrf token"})
-    return await call_next(request)
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "no-referrer-when-downgrade"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'"
+    )
+    return resp
 
 
 app.include_router(auth_api.router)
@@ -194,6 +203,7 @@ app.include_router(manage_api.router)
 app.include_router(clients_api.router)
 app.include_router(rules_api.router)
 app.include_router(logs_api.router)
+app.include_router(telemetry_api.router)
 
 
 @app.get("/api/logs")

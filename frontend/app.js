@@ -99,7 +99,7 @@ function renderNodes() {
       <div class="head"><strong>${n.is_active ? "⭐ " : ""}${esc(n.name)}</strong><span>${hdot(hs)} ${FA_HEALTH[hs] || hs}</span></div>
       <div class="meta" dir="ltr">${esc(n.protocol)} · ${esc(n.server)}:${n.port} · ${esc(n.transport || "")} ${esc(n.security || "")}</div>
       <div class="meta">تأخیر: <span dir="ltr">${n.latency_ms != null ? n.latency_ms + " ms" : "—"}</span> · خطاهای پیاپی: ${n.fail_count || 0} · موفق: ${n.success_count || 0} · آخرین خطا: ${esc(n.last_error || "—")}${n.egress_ok ? ' · <span class="ok">egress ✓</span>' : ""}${n.removed_upstream ? ' · <span class="warn">حذف‌شده از اشتراک</span>' : ""}${n.enabled ? "" : ' · <span class="warn">غیرفعال</span>'}</div>
-      <div class="actions"><button onclick="nodeAct(${n.id},'activate')">فعال‌سازی</button><button onclick="nodeAct(${n.id},'test')">تست</button>
+      <div class="actions"><button onclick="nodeActSafe(${n.id},'activate')">فعال‌سازی</button><button onclick="nodeAct(${n.id},'test')">تست</button>
       <button onclick="nodeToggle(${n.id},${n.enabled})">${n.enabled ? "غیرفعال" : "فعال"}</button>
       <button onclick="nodeRename(${n.id})">تغییرنام</button></div>
     </div>`; }).join("") || `<div class="card muted">نودی یافت نشد.</div>`;
@@ -250,6 +250,98 @@ async function loadHealth() {
     <td><button class="small" onclick="nodeAct(${n.id},'test')">تست</button></td></tr>`; }).join("")}</tbody></table>`;
 }
 
+/* ---------- health cycles / lifecycle / telemetry / connections ---------- */
+function fmtAgo(iso) {
+  if (!iso) return "—";
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return "—";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + " ثانیه پیش";
+  if (s < 3600) return Math.floor(s / 60) + " دقیقه پیش";
+  return Math.floor(s / 3600) + " ساعت پیش";
+}
+async function loadHealthCycles() {
+  try {
+    const c = await api("/api/health/cycles");
+    const row = (name, d) => `<tr><td>${name}</td><td dir="ltr">${esc(d.last_cycle || "—")}</td><td>${fmtAgo(d.last_cycle)}</td><td dir="ltr">${d.duration_ms != null ? Math.round(d.duration_ms) + " ms" : "—"}</td><td dir="ltr">${d.seconds_since_last != null ? Math.round(d.seconds_since_last) + "s" : "—"}</td></tr>`;
+    $("healthCycles").innerHTML = `<table><thead><tr><th>چرخه</th><th>آخرین اجرا</th><th>قدمت</th><th>مدت</th><th>از آخرین</th></tr></thead><tbody>
+      ${row("fast", c.fast_loop)}${row("active", c.active_loop)}${row("deep", c.deep_loop)}${row("ranking", c.ranking_loop)}
+      </tbody></table><p class="muted">خطاهای پیاپی چرخه: ${c.cycle_failure_count} · در حال اجرا: ${c.running ? "بله" : "خیر"}</p>`;
+  } catch (e) { $("healthCycles").innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+async function loadLifecycle() {
+  try {
+    const s = await api("/api/lifecycle/status");
+    const a = s.active_node;
+    $("lifecycleStatus").innerHTML = a
+      ? `<table><tr><td>نود فعال</td><td>${esc(a.name)} (#${a.id})</td></tr>
+         <tr><td>مدت فعالیت</td><td dir="ltr">${a.duration_hours}h / ${a.max_duration_hours}h (باقی‌مانده ${a.remaining_hours}h)</td></tr>
+         <tr><td>سیاست</td><td>فعال: ${s.enabled ? "بله" : "خیر"} · dry-run: ${s.dry_run ? "بله" : "خیر"}</td></tr></table>`
+      : `<p class="muted">نود فعالی وجود ندارد.</p>`;
+    $("lifecycleRotate").innerHTML = `<p class="muted">چرخش دستی به بهترین نود سالم واجدشرایط انجام می‌شود.</p>`;
+    const rows = await api("/api/audit?action=node.activate&limit=20");
+    const rel = rows.filter((e) => /rotation|failover/.test(e.detail || ""));
+    $("rotationHistory").innerHTML = rel.length
+      ? `<table><thead><tr><th>زمان</th><th>عامل</th><th>جزئیات</th></tr></thead><tbody>${rel.map((e) => `<tr><td dir="ltr">${esc(e.at || "")}</td><td>${esc(e.actor)}</td><td>${esc(e.detail)}</td></tr>`).join("")}</tbody></table>`
+      : `<p class="muted">تاریخچه چرخش/فیlover یافت نشد.</p>`;
+  } catch (e) { $("lifecycleStatus").innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+async function doRotate() {
+  if (!confirm("چرخش کنترل‌شده به بهترین نود سالم انجام شود؟")) return;
+  const msg = $("rotateMsg"); if (msg) msg.textContent = "در حال چرخش…";
+  try {
+    const r = await api("/api/lifecycle/rotate", { method: "POST" });
+    if (msg) msg.textContent = r.switched ? ("انجام شد: " + (r.reason || "")) : ("انجام نشد: " + (r.reason || ""));
+    toast(r.switched ? "چرخش انجام شد" : "چرخش انجام نشد"); await refreshAll();
+  } catch (e) { if (msg) msg.textContent = e.message; }
+}
+function drawBars(canvasId, labels, values, noteId, note) {
+  const cv = document.getElementById(canvasId); if (!cv) return;
+  const ctx = cv.getContext("2d"); const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!values.length) { ctx.fillText("داده‌ای نیست", 10, 20); return; }
+  const mx = Math.max(...values, 1);
+  const bw = W / values.length;
+  values.forEach((v, i) => { const h = (v / mx) * (H - 30); ctx.fillRect(i * bw + 2, H - 20 - h, bw - 4, h); });
+  if (noteId && document.getElementById(noteId)) document.getElementById(noteId).textContent = note || "";
+}
+async function loadTelemetry() {
+  try {
+    const node = $("telNode").value, type = $("telType").value, oc = $("telOutcome").value, hours = +$("telHours").value || 24;
+    if ($("telNode").options.length <= 1) {
+      $("telNode").innerHTML = `<option value="">همه نودها</option>` + NODES.map((n) => `<option value="${n.id}">${esc(n.name)}</option>`).join("");
+    }
+    const q = new URLSearchParams({ hours: String(hours), bucket_minutes: "60", limit: "200" });
+    if (node) q.set("node_id", node);
+    if (type) q.set("probe_type", type);
+    const [sum, ser] = await Promise.all([
+      api("/api/telemetry/summary?" + new URLSearchParams({ hours: String(hours), ...(node ? { node_id: node } : {}), ...(type ? { probe_type: type } : {}) })),
+      api("/api/telemetry/series?" + q.toString()),
+    ]);
+    const rows = ser.rows.filter((r) => !oc || (oc === "success" ? r.ok : !r.ok));
+    $("telSummary").innerHTML = sum.total
+      ? `<table><tr><td>بازه</td><td dir="ltr">${sum.window_hours}h (${esc(sum.from)} تا ${esc(sum.to)})</td></tr>
+         <tr><td>کل نمونه‌ها</td><td dir="ltr">${sum.total} (موفق ${sum.ok} · نرخ ${sum.success_rate ?? "—"})</td></tr>
+         <tr><td>تأخیر p50/p95/p99</td><td dir="ltr">${sum.p50 ?? "—"} / ${sum.p95 ?? "—"} / ${sum.p99 ?? "—"} ms (نمونه ${sum.latency_samples})</td></tr>
+         <tr><td>کفایت نمونه</td><td>${sum.sufficient_for_percentiles ? "کافی (≥20)" : "ناکافی — درصدها معتبر نیست"}</td></tr></table>`
+      : `<p class="muted">داده‌ای در این بازه نیست (صفر نمونه ≠ صفر خطا).</p>`;
+    drawBars("telLatencyChart", ser.series.map((s) => s.bucket), ser.series.map((s) => s.p50 || 0), null);
+    drawBars("telSuccessChart", ser.series.map((s) => s.bucket), ser.series.map((s) => (s.success_rate ?? 0) * 100), null);
+    $("telTable").querySelector("tbody").innerHTML = rows.slice(0, 100).map((r) => `<tr><td dir="ltr">${esc(r.at || "")}</td><td>${esc(r.node_name)}</td><td>${esc(r.probe_type)}</td><td>${r.ok ? dot("ok") + " موفق" : dot("bad") + " ناموفق"}</td><td dir="ltr">${r.latency_ms ?? "—"}</td><td>${esc(r.error_type || "")}</td></tr>`).join("");
+  } catch (e) { $("telSummary").innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+async function loadConnections() {
+  try {
+    const c = await api("/api/connections?limit=100");
+    $("connInfo").innerHTML = `<table>
+      <tr><td>شنونده HTTP</td><td>${c.listeners.http ? dot("ok") + " باز" : dot("bad") + " بسته"}</td></tr>
+      <tr><td>شنونده SOCKS</td><td>${c.listeners.socks ? dot("ok") + " باز" : dot("bad") + " بسته"}</td></tr>
+      <tr><td>خروجی فعال</td><td>${c.active_outbound ? esc(c.active_outbound.name) : "—"}</td></tr></table>
+      <p class="muted">${esc(c.limitation || "")}</p>`;
+    $("connTable").querySelector("tbody").innerHTML = (c.recent || []).map((r) => `<tr><td dir="ltr">${esc(r.at || "")}</td><td dir="ltr">${esc(r.client || "")}</td><td dir="ltr">${esc(r.dest || "")}:${r.port}</td><td>${esc(r.inbound)}</td><td>${esc(r.outbound)}</td><td>${esc(r.status || "")}</td></tr>`).join("");
+  } catch (e) { $("connInfo").innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+
 /* ---------- logs ---------- */
 const LOG_ACTIONS = ["login.ok", "login.failed", "node.activate", "subscription.update", "rule.create", "rule.update", "rule.delete", "client.create", "client.rotate", "settings.update", "routing.create"];
 $("logAction").innerHTML = `<option value="">همه رویدادها</option>` + LOG_ACTIONS.map((a) => `<option>${a}</option>`).join("");
@@ -311,6 +403,22 @@ $("saveGwBtn").onclick = async () => {
   } catch (e) { $("gwMsg").textContent = e.message; }
 };
 
-async function refreshAll() { await loadDash(); await loadNodes(); await loadClients(); await loadRules(); await loadSub(); await loadHealth(); await loadLogs(); await loadSystem(); await loadSettings(); }
+async function refreshAll() {
+  await loadDash(); await loadNodes(); await loadClients(); await loadRules(); await loadSub();
+  await loadHealth(); await loadHealthCycles(); await loadLifecycle(); await loadTelemetry(); await loadConnections();
+  await loadLogs(); await loadSystem(); await loadSettings();
+  const rb = $("rotateBtn"); if (rb && !rb._bound) { rb._bound = true; rb.onclick = doRotate; }
+  const tf = $("telFilterBtn"); if (tf && !tf._bound) { tf._bound = true; tf.onclick = loadTelemetry; }
+  const cf = $("connFilterBtn"); if (cf && !cf._bound) { cf._bound = true; cf.onclick = loadConnections; }
+  const tr = $("telResetBtn"); if (tr && !tr._bound) { tr._bound = true; tr.onclick = () => { $("telNode").value = ""; $("telType").value = ""; $("telOutcome").value = ""; $("telHours").value = "24"; loadTelemetry(); }; }
+  const cr = $("connResetBtn"); if (cr && !cr._bound) { cr._bound = true; cr.onclick = loadConnections; }
+}
+async function nodeActSafe(id, act) {
+  if (act === "activate") {
+    const n = NODES.find((x) => x.id === id);
+    if (!confirm(`نود «${n ? n.name : id}» فعال شود؟ اتصال فعلی جابه‌جا می‌شود.`)) return;
+  }
+  await nodeAct(id, act);
+}
 (async () => { CSRF = getCsrf();
   try { await api("/api/auth/me"); showApp(); await refreshAll(); } catch { showLogin(); } })();

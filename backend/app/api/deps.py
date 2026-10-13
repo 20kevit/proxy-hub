@@ -28,14 +28,14 @@ def check_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail="bad csrf token")
 
 
-def set_auth_cookies(response: Response, username: str) -> str:
+def set_auth_cookies(response: Response, username: str, secure: bool = False) -> str:
     from ..services.auth import create_session
 
     token = create_session(username)
     response.set_cookie(
-        "ph_session", token, httponly=True, samesite="lax", secure=False,
+        "ph_session", token, httponly=True, samesite="lax", secure=secure,
         path="/", max_age=12 * 3600,
     )
     csrf = new_csrf()
-    response.set_cookie("ph_csrf", csrf, samesite="lax", secure=False, path="/", max_age=12 * 3600)
+    response.set_cookie("ph_csrf", csrf, samesite="lax", secure=secure, path="/", max_age=12 * 3600)
     return csrf

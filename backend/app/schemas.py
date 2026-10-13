@@ -44,10 +44,19 @@ class RoutingRuleIn(BaseModel):
 class SettingsIn(BaseModel):
     sub_update_interval: int | None = None
     health_interval: int | None = None
+    active_probe_interval: int | None = None
+    deep_probe_interval: int | None = None
     health_url: str | None = None
+    health_timeout: int | None = None
     failover_mode: str | None = None
     failover_threshold: int | None = None
     failover_cooldown: int | None = None
+    failover_min_healthy: int | None = None
+    rotation_enabled: bool | None = None
+    rotation_max_duration_hours: int | None = None
+    rotation_exclusion_hours: int | None = None
+    rotation_dry_run: bool | None = None
+    rotation_check_interval: int | None = None
     gateway_enabled: bool | None = None
     gateway_bind: str | None = None
     public_socks_port: int | None = None
