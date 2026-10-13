@@ -198,13 +198,19 @@ def attempt_transition(session, candidate: ProxyNode, active: ProxyNode | None,
         eg = None
         log.warning("pre-switch verification error for node %s: %s",
                     candidate.id, type(exc).__name__)
-    if eg is None or not eg.ok:
+    if eg is None or (not eg.ok and eg.error_type == "unverified"):
+        # Environment limitation (missing binary etc.), not node evidence:
+        # skip without mutating the candidate's counters or egress state.
+        detail = (eg.error if eg else "verification error")[:200]
+        log.info("pre-switch check unverified for node %s: %s", candidate.id, detail)
+        return False, f"#{candidate.id} unverified ({detail})"
+    if not eg.ok:
         candidate.egress_ok = False
         candidate.consecutive_failures = (candidate.consecutive_failures or 0) + 1
         candidate.consecutive_successes = 0
-        candidate.last_error = (eg.error if eg else "verification error")[:500]
+        candidate.last_error = eg.error[:500]
         session.commit()
-        return False, f"#{candidate.id} unverified ({candidate.last_error})"
+        return False, f"#{candidate.id} egress failed ({candidate.last_error})"
     candidate.egress_ok = True
     candidate.consecutive_failures = 0
     candidate.consecutive_successes = (candidate.consecutive_successes or 0) + 1

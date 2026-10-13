@@ -19,6 +19,20 @@ from ..models import ProxyNode
 log = logging.getLogger("proxyhub.health_v2")
 
 
+def uses_tcp_transport(node) -> bool:
+    """Whether TCP connect / TLS handshake probes are meaningful for a node.
+
+    Hysteria2 (and any future QUIC/UDP transport) does not speak TCP on its
+    service port, so TCP dials and TLS handshakes against it can never
+    succeed — running them would fabricate failures for healthy nodes.
+    Such nodes are verified exclusively by genuine egress checks
+    (ephemeral per-protocol core in the deep loop / pre-switch path).
+    Unknown or empty transports default to TCP behavior (backward compatible).
+    """
+    transport = (getattr(node, "transport", "") or "").strip().lower()
+    return transport not in ("udp", "quic")
+
+
 def _circuit_cooldown_seconds(db) -> int:
     """Breaker open duration, derived from the configured failover cooldown.
 
@@ -289,6 +303,10 @@ class HealthEngineV2:
             
             now_utc = datetime.now(timezone.utc)
             for node in nodes:
+                if not uses_tcp_transport(node):
+                    # UDP/QUIC transports answer no TCP dial: skip rather than
+                    # fabricate failures; egress is verified in the deep loop.
+                    continue
                 try:
                     if node.circuit_open and node.circuit_open_until:
                         circuit_until = node.circuit_open_until
@@ -367,6 +385,10 @@ class HealthEngineV2:
             # _update_active_metrics: egress_ok is set True solely from an
             # app-level (HTTP) result.
             for node in candidates:
+                if node.id != (active_node.id if active_node else -1) and not uses_tcp_transport(node):
+                    # No meaningful TCP/TLS probe exists for UDP transports;
+                    # covered by genuine egress checks in the deep loop.
+                    continue
                 try:
                     if node.id == (active_node.id if active_node else -1):
                         result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
@@ -494,7 +516,18 @@ class HealthEngineV2:
     def _update_deep_metrics(self, db, node: ProxyNode, result: ProbeResult):
         now = datetime.now(timezone.utc)
         node.last_checked = now
-        
+
+        if result.error_type == "unverified":
+            # The verifier could not run for this node (missing binary,
+            # invalid local environment, unsupported protocol). This is NOT
+            # evidence about the node: record telemetry/history and leave
+            # counters, egress state and health untouched.
+            node.last_error = result.error[:500]
+            self._record_probe_telemetry(db, node.id, "deep", result, http_status=None)
+            self._record_probe_history(node, result)
+            node.quality_score = QualityCalculator.calculate(node)
+            return
+
         if result.ok:
             node.app_latency_ms = result.app_latency_ms
             node.latency_ms = result.app_latency_ms

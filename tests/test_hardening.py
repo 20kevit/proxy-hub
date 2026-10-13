@@ -568,3 +568,336 @@ def test_max_connections_is_metadata():
 
 def _login_here():
     return _fresh_login()
+
+
+# --- Hysteria2 egress verification (isolated ephemeral sing-box) ---------------
+
+def _hy2_node(**kw):
+    from app.models import ProxyNode
+    base = dict(fingerprint="fp-hy2", name="HY2", protocol="hysteria2",
+                server="hy.example.com", port=8444, secret="pw",
+                transport="udp", security="tls",
+                params={"sni": "hy.example.com"})
+    base.update(kw)
+    return ProxyNode(**base)
+
+
+def _fake_settings(tmp_path):
+    import types
+    return types.SimpleNamespace(
+        xray_config=tmp_path / "xray.json",
+        singbox_config=tmp_path / "sing-box.json",
+        xray_bin="/nonexistent-xray",
+        singbox_bin="/nonexistent-singbox",
+        socks_port=2081, http_port=1081,
+    )
+
+
+class _FakeProc:
+    def __init__(self, exit_early=False):
+        self._exit_early = exit_early
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return 1 if self._exit_early else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _FakeSock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeResp:
+    def raise_for_status(self):
+        return None
+
+
+class _FakeClient:
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url):
+        return _FakeResp()
+
+
+def _patch_ephemeral_success(monkeypatch, tmp_path):
+    import socket as _socket
+    import httpx as _httpx
+    import subprocess as _sp
+    from app.services import cores as C
+
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.SingBoxAdapter, "installed", lambda self: True)
+
+    class _Run:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Run())
+    procs = []
+    orig_popen = _sp.Popen
+
+    def fake_popen(*a, **k):
+        p = _FakeProc()
+        procs.append((a, p))
+        return p
+
+    monkeypatch.setattr(_sp, "Popen", fake_popen)
+    monkeypatch.setattr(_socket, "create_connection", lambda *a, **k: _FakeSock())
+    monkeypatch.setattr(_httpx, "Client", _FakeClient)
+    return procs
+
+
+def test_ephemeral_singbox_success_and_cleanup(monkeypatch, tmp_path):
+    from app.services import cores as C
+
+    procs = _patch_ephemeral_success(monkeypatch, tmp_path)
+    with C.EphemeralSingBox(_hy2_node()) as proxy_url:
+        assert proxy_url.startswith("socks5h://127.0.0.1:")
+        port = int(proxy_url.rsplit(":", 1)[1])
+        assert port > 0
+    assert len(procs) == 1
+    assert procs[0][1].terminated is True  # process stopped
+    assert list(tmp_path.glob("verify-sb-*.json")) == []  # config removed
+
+
+def test_ephemeral_singbox_invalid_config(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.SingBoxAdapter, "installed", lambda self: True)
+
+    class _Bad:
+        returncode = 1
+        stdout = ""
+        stderr = "bad outbound"
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Bad())
+    import pytest
+    with pytest.raises(C.CoreError, match="verify config invalid"):
+        with C.EphemeralSingBox(_hy2_node()):
+            pass
+    assert list(tmp_path.glob("verify-sb-*.json")) == []
+
+
+def test_ephemeral_singbox_startup_failure(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.SingBoxAdapter, "installed", lambda self: True)
+
+    class _Run:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Run())
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **k: _FakeProc(exit_early=True))
+    import pytest
+    with pytest.raises(C.CoreError, match="exited during startup"):
+        with C.EphemeralSingBox(_hy2_node()):
+            pass
+    assert list(tmp_path.glob("verify-sb-*.json")) == []
+
+
+def test_verify_hy2_http_and_tls_failures(monkeypatch, tmp_path):
+    import httpx as _httpx
+    from app.services import cores as C
+
+    _patch_ephemeral_success(monkeypatch, tmp_path)
+
+    class _TimeoutClient(_FakeClient):
+        def get(self, url):
+            raise _httpx.TimeoutException("timed out")
+
+    class _TlsClient(_FakeClient):
+        def get(self, url):
+            raise _httpx.ConnectError("SSL: EOF occurred")
+
+    monkeypatch.setattr(_httpx, "Client", _TimeoutClient)
+    r = C.verify_node_egress(_hy2_node(), "https://x.test", timeout=1)
+    assert r.ok is False and r.error_type == "timeout"
+    assert list(tmp_path.glob("verify-sb-*.json")) == []  # cleaned on failure path
+
+    monkeypatch.setattr(_httpx, "Client", _TlsClient)
+    r = C.verify_node_egress(_hy2_node(), "https://x.test", timeout=1)
+    assert r.ok is False and r.error_type == "tls_error"
+
+
+def test_verify_dispatch_by_protocol(monkeypatch, tmp_path):
+    import subprocess as _sp
+    from app.services import cores as C
+
+    seen = {}
+
+    class _X:
+        def __init__(self, node):
+            seen["xray"] = node.protocol
+
+        def __enter__(self):
+            return "socks5h://127.0.0.1:1"
+
+        def __exit__(self, *a):
+            return False
+
+    class _S:
+        def __init__(self, node):
+            seen["singbox"] = node.protocol
+
+        def __enter__(self):
+            return "socks5h://127.0.0.1:2"
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(C, "EphemeralXray", _X)
+    monkeypatch.setattr(C, "EphemeralSingBox", _S)
+    monkeypatch.setattr(C, "_probe_http",
+                        lambda *a: C.EgressResult(ok=True, app_latency_ms=5.0))
+
+    from app.models import ProxyNode
+    vless = ProxyNode(fingerprint="a", name="v", protocol="vless",
+                      server="s", port=1, secret="u", params={})
+    assert C.verify_node_egress(vless, "https://x.test").ok is True
+    assert seen == {"xray": "vless"}
+
+    seen.clear()
+    assert C.verify_node_egress(_hy2_node(), "https://x.test").ok is True
+    assert seen == {"singbox": "hysteria2"}
+
+    # Unknown protocol: honest unverified, no subprocess spawned.
+    spawned = []
+    monkeypatch.setattr(_sp, "Popen", lambda *a, **k: spawned.append(a) or _FakeProc())
+    weird = ProxyNode(fingerprint="w", name="w", protocol="wireguard",
+                      server="s", port=1, secret="u", params={})
+    r = C.verify_node_egress(weird, "https://x.test")
+    assert r.ok is False and r.error_type == "unverified"
+    assert spawned == []
+
+
+def test_singbox_missing_binary_is_unverified(monkeypatch, tmp_path):
+    from app.services import cores as C
+
+    monkeypatch.setattr(C, "get_settings", lambda: _fake_settings(tmp_path))
+    monkeypatch.setattr(C.SingBoxAdapter, "installed", lambda self: False)
+    r = C.verify_node_egress(_hy2_node(), "https://x.test", timeout=1)
+    assert r.ok is False and r.error_type == "unverified"
+
+
+def test_deep_unverified_leaves_counters_untouched(db):
+    from app.services import health_v2 as hv
+
+    n = _mk(db, "unv-node")
+    n.consecutive_failures = 2
+    n.egress_ok = True
+    n.health = "healthy"
+    db.commit()
+    eng = hv.HealthEngineV2()
+    eng._update_deep_metrics(
+        db, n, hv.ProbeResult(ok=False, error="sing-box is not installed",
+                             error_type="unverified"))
+    db.commit()
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == n.id).first()
+    assert row.consecutive_failures == 2  # not incremented
+    assert row.egress_ok is True  # not cleared
+    assert row.health == "healthy"  # not poisoned
+
+
+def test_attempt_transition_skips_unverified_without_mutation(db, monkeypatch):
+    import app.services.failover as fo
+
+    monkeypatch.setattr("app.services.cores.verify_node_egress",
+                        lambda node, url, timeout=15: type("R", (), {
+                            "ok": False, "app_latency_ms": None,
+                            "error": "sing-box is not installed",
+                            "error_type": "unverified"})())
+    applied = []
+    monkeypatch.setattr("app.services.cores.XrayAdapter.apply",
+                        lambda self, node, session=None, force_restart=False: applied.append(node.id))
+    active = _mk(db, "t-active", active=True)
+    cand = _mk(db, "t-hy2")
+    cand.protocol = "hysteria2"
+    cand.transport = "udp"
+    db.commit()
+    ok, reason = fo.attempt_transition(db, cand, active, actor="t",
+                                       audit=lambda a, x, d: None,
+                                       reason_kind="failover")
+    assert ok is False and "unverified" in reason
+    assert applied == []  # never attempted activation
+    db.expire_all()
+    row = db.query(ProxyNode).filter(ProxyNode.id == cand.id).first()
+    assert row.consecutive_failures == 0  # untouched
+
+
+def test_hy2_failover_end_to_end(db, monkeypatch):
+    import app.services.failover as fo
+
+    monkeypatch.setattr("app.services.cores.verify_node_egress",
+                        lambda node, url, timeout=15: type("R", (), {
+                            "ok": True, "app_latency_ms": 150.0,
+                            "error": "", "error_type": ""})())
+    monkeypatch.setattr("app.services.cores.SingBoxAdapter.apply",
+                        lambda self, node, session=None, force_restart=False: None)
+    monkeypatch.setattr("app.services.cores.SingBoxAdapter.installed",
+                        lambda self: True)
+    from app.services.failover import session_set
+    session_set(db, "gateway_enabled", "false")
+    session_set(db, "failover_mode", "auto")
+    session_set(db, "failover_threshold", "3")
+    session_set(db, "failover_cooldown", "0")
+    session_set(db, "failover_min_healthy", "1")
+    from datetime import timedelta
+    active = _mk(db, "t-active2", active=True)
+    active.consecutive_failures = 5
+    active.last_state_change = datetime.now(timezone.utc) - timedelta(seconds=10)
+    cand = _mk(db, "t-hy2-ok")
+    cand.protocol = "hysteria2"
+    cand.transport = "udp"
+    cand.egress_ok = True
+    db.commit()
+    audited = []
+    res = fo.maybe_failover(db, active, audit=lambda a, x, d: audited.append((a, x, d)))
+    assert res["switched"] is True and res["node_id"] == cand.id
+    assert any(a == "failover" and x == "node.activate" for a, x, d in audited)
+
+
+def test_udp_transport_skipped_in_fast_loop(db, monkeypatch):
+    from app.services import health_v2 as hv
+
+    probed = []
+    tcp_node = _mk(db, "tcp-node")
+    hy_node = _mk(db, "hy-node")
+    hy_node.protocol = "hysteria2"
+    hy_node.transport = "udp"
+    db.commit()
+
+    def spy(host, port, timeout=2.0):
+        probed.append(host)
+        return hv.ProbeResult(ok=True, tcp_latency_ms=9.0)
+
+    monkeypatch.setattr(hv, "tcp_probe", spy)
+    hv.HealthEngineV2()._fast_check_all_sync()
+    assert probed == ["x.ir"]  # exactly one TCP probe: the TCP node

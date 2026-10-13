@@ -752,20 +752,138 @@ class EphemeralXray:
             [settings.xray_bin, "run", "-config", tmp],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        deadline = time.monotonic() + 8.0
+        try:
+            return _wait_for_port(self._proc, self.port, "xray")
+        except CoreError:
+            self._cleanup()
+            raise
+
+    def __exit__(self, *exc_info) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._proc is not None:
+            proc, self._proc = self._proc, None
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            except OSError:
+                pass
+        if self._cfg_path is not None:
+            path, self._cfg_path = self._cfg_path, None
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _wait_for_port(proc: subprocess.Popen, port: int, label: str) -> str:
+    """Wait (bounded) for a spawned core to accept localhost connections."""
+    import socket as _socket
+
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise CoreError(f"verify {label} exited during startup")
+        try:
+            with _socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return f"socks5h://127.0.0.1:{port}"
+        except OSError:
+            time.sleep(0.2)
+    raise CoreError(f"verify {label} did not listen in time")
+
+
+def _probe_http(proxy_url: str, test_url: str, timeout: int, started: float) -> EgressResult:
+    """Single bounded HTTP probe through an already-running local proxy."""
+    try:
+        import httpx as _httpx
+
+        with _httpx.Client(proxy=proxy_url, timeout=timeout) as client:
+            resp = client.get(test_url)
+            resp.raise_for_status()
+            ms = round((time.monotonic() - started) * 1000, 1)
+            return EgressResult(ok=True, app_latency_ms=ms)
+    except Exception as exc:  # noqa: BLE001 - mapped below, never re-raised
+        name = type(exc).__name__
+        text = str(exc)
+        if "Timeout" in name or "timeout" in text.lower():
+            return EgressResult(ok=False, error="http_timeout", error_type="timeout")
+        if "SSL" in text or "TLS" in text:
+            return EgressResult(ok=False, error="tls_error", error_type="tls_error")
+        if "reset" in text.lower():
+            return EgressResult(ok=False, error="reset", error_type="reset")
+        if "HTTPStatusError" in name or "Status" in name:
+            return EgressResult(ok=False, error="http_error", error_type="http_error")
+        return EgressResult(ok=False, error=name, error_type="connect_error")
+
+
+class EphemeralSingBox:
+    """Temporary sing-box instance routing a single Hysteria2 node.
+
+    Mirrors EphemeralXray: 127.0.0.1 ephemeral port, 0600 temp config next
+    to the managed config, always cleaned up, managed core untouched. TLS
+    verification stays enabled (generate() rejects insecure/pinning modes).
+    """
+
+    def __init__(self, node: ProxyNode) -> None:
+        if node.protocol != "hysteria2":
+            raise CoreError(f"ephemeral sing-box check cannot handle protocol: {node.protocol}")
+        self._node = node
+        self._proc: subprocess.Popen | None = None
+        self._cfg_path: Path | None = None
+        self.port: int = 0
+
+    def _free_port(self) -> int:
         import socket as _socket
 
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                self._cleanup()
-                raise CoreError("verify xray exited during startup")
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def __enter__(self) -> str:
+        settings = get_settings()
+        adapter = SingBoxAdapter()
+        if not adapter.installed():
+            raise CoreError("sing-box is not installed")
+        self.port = self._free_port()
+        cfg = adapter.generate(self._node)
+        for inbound in cfg.get("inbounds", []):
+            inbound["listen_port"] = self.port
+        settings.singbox_config.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="verify-sb-", suffix=".json",
+                                   dir=str(settings.singbox_config.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh)
+            os.chmod(tmp, 0o600)
+            self._cfg_path = Path(tmp)
+        except OSError:
             try:
-                with _socket.create_connection(("127.0.0.1", self.port), timeout=0.5):
-                    return f"socks5h://127.0.0.1:{self.port}"
+                os.unlink(tmp)
             except OSError:
-                time.sleep(0.2)
-        self._cleanup()
-        raise CoreError("verify xray did not listen in time")
+                pass
+            raise
+        check = subprocess.run(
+            [settings.singbox_bin, "check", "-c", tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+        if check.returncode != 0:
+            self._cleanup()
+            raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
+        self._proc = subprocess.Popen(
+            [settings.singbox_bin, "run", "-c", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            return _wait_for_port(self._proc, self.port, "sing-box")
+        except CoreError:
+            self._cleanup()
+            raise
 
     def __exit__(self, *exc_info) -> None:
         self._cleanup()
@@ -792,37 +910,30 @@ class EphemeralXray:
 
 
 def verify_node_egress(node: ProxyNode, test_url: str, timeout: int = 15) -> EgressResult:
-    """Genuinely verify one node's egress via an isolated ephemeral Xray.
+    """Genuinely verify one node's egress via an isolated ephemeral core.
 
-    Never raises for probe failures (returns EgressResult); raises CoreError
-    only for local environment problems (missing binary), which callers treat
-    as 'unverified'. No secrets are included in error strings.
+    Xray-capable protocols use an ephemeral Xray instance; Hysteria2 uses an
+    ephemeral sing-box instance; anything else reports "unverified" (never
+    fabricated). Never raises for probe failures (returns EgressResult);
+    environment problems (missing binary) are also reported as "unverified",
+    which callers treat as *not evidence of health*. No secrets are included
+    in error strings.
     """
     import time as _time
 
     started = _time.monotonic()
     try:
-        with EphemeralXray(node) as proxy_url:
-            try:
-                import httpx as _httpx
-
-                with _httpx.Client(proxy=proxy_url, timeout=timeout) as client:
-                    resp = client.get(test_url)
-                    resp.raise_for_status()
-                    ms = round((_time.monotonic() - started) * 1000, 1)
-                    return EgressResult(ok=True, app_latency_ms=ms)
-            except Exception as exc:  # noqa: BLE001 - mapped below, never re-raised
-                name = type(exc).__name__
-                text = str(exc)
-                if "Timeout" in name or "timeout" in text.lower():
-                    return EgressResult(ok=False, error="http_timeout", error_type="timeout")
-                if "SSL" in text or "TLS" in text:
-                    return EgressResult(ok=False, error="tls_error", error_type="tls_error")
-                if "reset" in text.lower():
-                    return EgressResult(ok=False, error="reset", error_type="reset")
-                if "HTTPStatusError" in name or "Status" in name:
-                    return EgressResult(ok=False, error="http_error", error_type="http_error")
-                return EgressResult(ok=False, error=name, error_type="connect_error")
+        if node.protocol in XRAY_BUILDERS:
+            ephemeral: EphemeralXray | EphemeralSingBox = EphemeralXray(node)
+        elif node.protocol == "hysteria2":
+            ephemeral = EphemeralSingBox(node)
+        else:
+            return EgressResult(
+                ok=False,
+                error=f"no isolated verifier for protocol: {node.protocol}",
+                error_type="unverified")
+        with ephemeral as proxy_url:
+            return _probe_http(proxy_url, test_url, timeout, started)
     except CoreError as exc:
         return EgressResult(ok=False, error=str(exc)[:200], error_type="unverified")
 
