@@ -99,9 +99,9 @@ function renderNodes() {
       <div class="head"><strong>${n.is_active ? "⭐ " : ""}${esc(n.name)}</strong><span>${hdot(hs)} ${FA_HEALTH[hs] || hs}</span></div>
       <div class="meta" dir="ltr">${esc(n.protocol)} · ${esc(n.server)}:${n.port} · ${esc(n.transport || "")} ${esc(n.security || "")}</div>
       <div class="meta">تأخیر: <span dir="ltr">${n.latency_ms != null ? n.latency_ms + " ms" : "—"}</span> · خطاهای پیاپی: ${n.fail_count || 0} · موفق: ${n.success_count || 0} · آخرین خطا: ${esc(n.last_error || "—")}${n.egress_ok ? ' · <span class="ok">egress ✓</span>' : ""}${n.removed_upstream ? ' · <span class="warn">حذف‌شده از اشتراک</span>' : ""}${n.enabled ? "" : ' · <span class="warn">غیرفعال</span>'}</div>
-      <div class="actions"><button onclick="nodeActSafe(${n.id},'activate')">فعال‌سازی</button><button onclick="nodeAct(${n.id},'test')">تست</button>
-      <button onclick="nodeToggle(${n.id},${n.enabled})">${n.enabled ? "غیرفعال" : "فعال"}</button>
-      <button onclick="nodeRename(${n.id})">تغییرنام</button></div>
+      <div class="actions"><button data-action="node-activate" data-id="${n.id}">فعال‌سازی</button><button data-action="node-test" data-id="${n.id}">تست</button>
+      <button data-action="node-toggle" data-id="${n.id}" data-enabled="${n.enabled ? 1 : 0}">${n.enabled ? "غیرفعال" : "فعال"}</button>
+      <button data-action="node-rename" data-id="${n.id}">تغییرنام</button></div>
     </div>`; }).join("") || `<div class="card muted">نودی یافت نشد.</div>`;
 }
 $("nodeSearch").oninput = renderNodes; $("nodeFilter").onchange = renderNodes; $("nodeSort").onchange = renderNodes;
@@ -123,9 +123,9 @@ async function loadRules() {
     <td>${x.priority}</td><td><b>${FA_MT[x.match_type] || x.match_type}</b> <span dir="ltr">${esc(x.pattern)}</span>${x.port ? ` <span dir="ltr">:${esc(x.port)}</span>` : ""}${x.network !== "any" ? ` (${x.network})` : ""}${x.note ? `<br><small class="muted">${esc(x.note)}</small>` : ""}</td>
     <td><span class="pill ${x.action}">${x.action}</span></td><td>${esc(x.client_scope)}</td>
     <td>${x.enabled ? dot("ok") : dot("off")}</td>
-    <td><button class="small" onclick="ruleMove(${x.id},'up')">↑</button><button class="small" onclick="ruleMove(${x.id},'down')">↓</button>
-    <button class="small" onclick="ruleEdit(${x.id})">ویرایش</button><button class="small" onclick="ruleDup(${x.id})">تکثیر</button>
-    <button class="small danger" onclick="ruleDel(${x.id})">حذف</button></td></tr>`).join("");
+    <td><button class="small" data-action="rule-move" data-id="${x.id}" data-dir="up">↑</button><button class="small" data-action="rule-move" data-id="${x.id}" data-dir="down">↓</button>
+    <button class="small" data-action="rule-edit" data-id="${x.id}">ویرایش</button><button class="small" data-action="rule-dup" data-id="${x.id}">تکثیر</button>
+    <button class="small danger" data-action="rule-del" data-id="${x.id}">حذف</button></td></tr>`).join("");
 }
 function openRuleDlg(rule) {
   $("ruleDlgTitle").textContent = rule ? "ویرایش قانون" : "قانون جدید";
@@ -170,7 +170,7 @@ $("simBtn").onclick = async () => {
 async function loadAppRules() {
   const r = await api("/api/routing");
   $("routeList").innerHTML = `<table>${r.rules.map((x) => `<tr><td>${esc(x.app)}</td><td>${x.route === "proxy" ? "→ پروکسی" : "→ مستقیم"}</td>
-    <td><button class="small danger" onclick="delAppRoute(${x.id})">حذف</button></td></tr>`).join("")}</table>`;
+    <td><button class="small danger" data-action="approute-del" data-id="${x.id}">حذف</button></td></tr>`).join("")}</table>`;
   $("proxyEnv").textContent = r.proxy_env;
 }
 async function delAppRoute(id) { try { await api(`/api/routing/${id}`, { method: "DELETE" }); await loadAppRules(); } catch (e) { toast(e.message, true); } }
@@ -190,18 +190,19 @@ async function loadClients() {
       <span>${c.usable ? dot("ok") + " فعال" : dot("bad") + " " + esc(c.status_detail || "غیرفعال")}</span></div>
       <div class="meta muted">نام کاربری: <b dir="ltr">${esc(c.username)}</b> · انقضا: <span dir="ltr">${esc(c.expires_at || "—")}</span> · آخرین استفاده: <span dir="ltr">${esc(c.last_used_at || "—")}</span>${c.dedicated_port ? ` · پورت اختصاصی: <span dir="ltr">${c.dedicated_port}</span>` : ""}</div>
       <div class="actions row">
-        <button class="small" onclick="clientConfig(${c.id})">پیکربندی</button>
-        <button class="small" onclick="clientQR(${c.id})">QR</button>
-        <button class="small" onclick="clientRotate(${c.id})">چرخش گذرواژه</button>
-        <button class="small" onclick="clientToggle(${c.id},${c.enabled})">${c.enabled ? "غیرفعال" : "فعال"}</button>
-        <button class="small danger" onclick="clientDel(${c.id})">حذف</button>
+        <button class="small" data-action="client-config" data-id="${c.id}">پیکربندی</button>
+        <button class="small" data-action="client-qr" data-id="${c.id}">QR</button>
+        <button class="small" data-action="client-rotate" data-id="${c.id}">چرخش گذرواژه</button>
+        <button class="small" data-action="client-toggle" data-id="${c.id}" data-enabled="${c.enabled ? 1 : 0}">${c.enabled ? "غیرفعال" : "فعال"}</button>
+        <button class="small danger" data-action="client-del" data-id="${c.id}">حذف</button>
       </div><div id="cfg-${c.id}"></div><div id="qr-${c.id}"></div>
     </div>`).join("") || `<p class="muted">دستگاهی ثبت نشده است.</p>`;
 }
 function clientConfig(id) {
   const c = CLIENTS.find((x) => x.id === id);
   const cfg = `SOCKS5\nServer: 194.60.231.172\nPort: ${GW.socks_port || "?"}\nUsername: ${c.username}\nPassword: (فقط لحظه‌ی ساخت/چرخش)\n\nHTTP\nServer: 194.60.231.172\nPort: ${GW.http_port || "?"}\nUsername: ${c.username}`;
-  $("cfg-" + id).innerHTML = `<pre dir="ltr">${esc(cfg)}</pre><button class="small" onclick="copyText(${JSON.stringify("socks5://" + c.username + "@194.60.231.172:" + (GW.socks_port || "?"))})">کپی خلاصه</button>`;
+  const summary = "socks5://" + c.username + "@194.60.231.172:" + (GW.socks_port || "?");
+  $("cfg-" + id).innerHTML = `<pre dir="ltr">${esc(cfg)}</pre><button class="small" data-action="copy-summary" data-text="${esc(summary)}">کپی خلاصه</button>`;
 }
 function clientQR(id) { $("qr-" + id).innerHTML = `<span class="qr"><img src="/api/clients/${id}/qr.png" alt="QR" width="180"></span>`; }
 async function clientRotate(id) { if (!confirm("گذرواژه‌ی جدید تولید و قبلی باطل شود؟")) return;
@@ -247,7 +248,7 @@ async function loadHealth() {
     ${ns.map((n) => { const hs = n.health_state || n.health; return `<tr><td>${n.is_active ? "⭐ " : ""}${esc(n.name)}</td><td>${hdot(hs)} ${FA_HEALTH[hs] || hs}</td>
     <td dir="ltr">${n.latency_ms != null ? n.latency_ms + " ms" : "—"}</td><td>${n.fail_count || 0}</td>
     <td dir="ltr">${esc(n.last_success || "—")}</td><td dir="ltr">${esc(n.last_checked || "—")}</td>
-    <td><button class="small" onclick="nodeAct(${n.id},'test')">تست</button></td></tr>`; }).join("")}</tbody></table>`;
+    <td><button class="small" data-action="node-test" data-id="${n.id}">تست</button></td></tr>`; }).join("")}</tbody></table>`;
 }
 
 /* ---------- health cycles / lifecycle / telemetry / connections ---------- */
@@ -420,5 +421,28 @@ async function nodeActSafe(id, act) {
   }
   await nodeAct(id, act);
 }
+/* Delegated handler for all dynamically-generated buttons (CSP: no inline onclick). */
+document.addEventListener("click", (ev) => {
+  const el = ev.target.closest("[data-action]");
+  if (!el) return;
+  const act = el.dataset.action, id = +(el.dataset.id || 0);
+  switch (act) {
+    case "node-activate": nodeActSafe(id, "activate"); break;
+    case "node-test": nodeAct(id, "test"); break;
+    case "node-toggle": nodeToggle(id, el.dataset.enabled === "1"); break;
+    case "node-rename": nodeRename(id); break;
+    case "rule-move": ruleMove(id, el.dataset.dir); break;
+    case "rule-edit": ruleEdit(id); break;
+    case "rule-dup": ruleDup(id); break;
+    case "rule-del": ruleDel(id); break;
+    case "approute-del": delAppRoute(id); break;
+    case "client-config": clientConfig(id); break;
+    case "client-qr": clientQR(id); break;
+    case "client-rotate": clientRotate(id); break;
+    case "client-toggle": clientToggle(id, el.dataset.enabled === "1"); break;
+    case "client-del": clientDel(id); break;
+    case "copy-summary": copyText(el.dataset.text || ""); break;
+  }
+});
 (async () => { CSRF = getCsrf();
   try { await api("/api/auth/me"); showApp(); await refreshAll(); } catch { showLogin(); } })();

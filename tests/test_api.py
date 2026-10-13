@@ -68,3 +68,39 @@ def test_status_shape():
     data = r.json()
     for key in ("running", "nodes", "subscription", "resources", "system_xray"):
         assert key in data
+
+
+def test_activate_unknown_node_404():
+    c = _login(_client_with_admin())
+    assert c.post("/api/nodes/424242/activate").status_code == 404
+
+
+def test_activate_requires_csrf():
+    c = _client_with_admin()
+    c.post("/api/auth/login", json={"username": "admin", "password": "pw123456"})
+    c.headers.pop("x-csrf-token", None)
+    assert c.post("/api/nodes/1/activate").status_code == 403
+
+
+def test_activate_ineligible_node_400():
+    from app.models import ProxyNode
+    c = _login(_client_with_admin())
+    db = get_session_factory()()
+    try:
+        db.add(ProxyNode(fingerprint="fp-off", name="Off", protocol="vless",
+                         server="x.ir", port=443, enabled=False))
+        db.commit()
+        nid = db.query(ProxyNode).filter(ProxyNode.fingerprint == "fp-off").first().id
+    finally:
+        db.close()
+    assert c.post(f"/api/nodes/{nid}/activate").status_code == 400
+
+
+def test_public_health_minimal():
+    from fastapi.testclient import TestClient as TC
+    c = _client_with_admin()
+    r = c.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) <= {"ok", "ts"}
+    assert "secret" not in r.text and "password" not in r.text

@@ -131,6 +131,69 @@ def test_failover_manual_mode(db):
     assert res == {"switched": False, "reason": "manual mode"}
 
 
+def test_failover_deprioritizes_recently_failed(db):
+    """A->B->A ping-pong guard: recently failed node is deprioritized, never excluded."""
+    from datetime import datetime, timezone
+    a = _mk(db, "node-a", latency=40.0, quality_score=80.0)
+    b = _mk(db, "node-b", latency=60.0, quality_score=79.0)
+    # No penalty recorded: higher quality wins
+    assert pick_failover_candidate(db).name == "node-a"
+    # Record A as failed 5 minutes ago: B preferred despite slightly lower quality
+    session_set(db, "last_failed_node_id", str(a.id))
+    session_set(db, "last_failed_at", datetime.now(timezone.utc).isoformat())
+    assert pick_failover_candidate(db).name == "node-b"
+    # Only A available besides excluded active: still selected (penalty never excludes)
+    b.enabled = False
+    db.commit()
+    assert pick_failover_candidate(db).name == "node-a"
+
+
+def test_successful_failover_records_last_failed(db, monkeypatch):
+    """Successful switch persists last_failed_* and audit trail (adapter mocked)."""
+    import app.services.failover as fo
+    from datetime import datetime, timezone, timedelta
+    monkeypatch.setattr("app.services.cores.XrayAdapter.apply",
+                        lambda self, node, session=None, force_restart=False: None)
+    session_set(db, "failover_mode", "auto")
+    session_set(db, "failover_threshold", "3")
+    session_set(db, "failover_cooldown", "0")
+    session_set(db, "failover_min_healthy", "1")
+    active = _mk(db, "active", active=True, fail=5, quality_score=20.0)
+    active.consecutive_failures = 5
+    active.last_state_change = datetime.now(timezone.utc) - timedelta(seconds=10)
+    cand = _mk(db, "standby", latency=50.0, quality_score=70.0)
+    db.commit()
+    audited = []
+    res = fo.maybe_failover(db, active, audit=lambda a, x, d: audited.append((a, x, d)))
+    assert res["switched"] is True and res["node_id"] == cand.id
+    assert fo.session_get(db, "last_failed_node_id") == str(active.id)
+    assert audited and audited[0][1] == "node.activate"
+    assert db.query(ProxyNode).filter(ProxyNode.id == cand.id).first().is_active is True
+
+
+def test_activate_node_rejects_ineligible(db):
+    """Validation precedes any config write: disabled/removed/circuit nodes rejected."""
+    import app.services.failover as fo
+    from app.services.cores import CoreError
+    import pytest
+    n = _mk(db, "gone")
+    n.removed_upstream = True
+    db.commit()
+    with pytest.raises(ValueError):
+        fo.activate_node(db, n)
+    n2 = _mk(db, "off")
+    n2.enabled = False
+    db.commit()
+    with pytest.raises(ValueError):
+        fo.activate_node(db, n2)
+    n3 = _mk(db, "open")
+    n3.circuit_open = True
+    db.commit()
+    with pytest.raises(ValueError):
+        fo.activate_node(db, n3)
+    assert issubclass(CoreError, RuntimeError)
+
+
 def test_routing_defaults(db):
     ensure_defaults(db)
     rules = ordered_rules(db)

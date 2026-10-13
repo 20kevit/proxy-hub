@@ -26,7 +26,21 @@ def pick_failover_candidate(session, exclude_id: int | None = None) -> ProxyNode
     candidates = q.all()
     if not candidates:
         return None
-    candidates.sort(key=lambda n: (-n.quality_score, n.rank, n.id))
+    # Deprioritize (never exclude) the most recently failed node to break
+    # A->B->A oscillation when several nodes are degraded at once.
+    penalized_id: int | None = None
+    try:
+        raw = session_get(session, "last_failed_node_id", "")
+        at = session_get(session, "last_failed_at", "")
+        if raw and at:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(at)).total_seconds()
+            if age < 3600:
+                penalized_id = int(raw)
+    except (ValueError, TypeError):
+        penalized_id = None
+    candidates.sort(key=lambda n: (
+        1 if (penalized_id is not None and n.id == penalized_id) else 0,
+        -n.quality_score, n.rank, n.id))
     return candidates[0]
 
 
@@ -68,9 +82,13 @@ def maybe_failover(session, active: ProxyNode, audit) -> dict:
         return {"switched": False, "reason": f"candidate quality too low: {candidate.quality_score}"}
 
     reason = f"failover: {active.name} (q={active.quality_score}) failed {active.consecutive_failures}x -> {candidate.name} (q={candidate.quality_score})"
+    failed_id = active.id
     activate_node(session, candidate, actor="failover", audit=audit, reason=reason)
-    session_set(session, "last_failover_at", datetime.now(timezone.utc).isoformat())
+    now_iso = datetime.now(timezone.utc).isoformat()
+    session_set(session, "last_failover_at", now_iso)
     session_set(session, "last_failover_reason", reason)
+    session_set(session, "last_failed_node_id", str(failed_id))
+    session_set(session, "last_failed_at", now_iso)
     return {"switched": True, "reason": reason, "node_id": candidate.id}
 
 
