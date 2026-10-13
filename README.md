@@ -13,14 +13,16 @@ proxy.
 ```
 clients -> gateway *:8388 (SOCKS5, auth) / *:8389 (HTTP, auth)
            -> routing engine (DIRECT/PROXY/BLOCK, default PROXY)
-           -> managed Xray -> active upstream node (egress 91.107.187.175)
-           -> panel/API 127.0.0.1:8899 (Persian RTL, 9 sections)
+           -> managed Xray -> active upstream node (auto-selected by quality)
+           -> panel/API 127.0.0.1:8899 (Persian RTL, 12 sections)
            -> system Xray 127.0.0.1:2080/1080 (UNMANAGED, left alone)
 ```
 
 ## Quick start (Phase 2)
 
-1. Panel via SSH tunnel: `ssh -p 9011 -N -L 8899:127.0.0.1:8899 root@194.60.231.172`
+1. Panel over HTTPS (Nginx reverse-proxy to loopback API; API itself stays
+   on 127.0.0.1). Fallback via SSH tunnel:
+   `ssh -p 9011 -N -L 8899:127.0.0.1:8899 root@194.60.231.172`
    → `http://127.0.0.1:8899`
 2. Devices & Access → create one client per device (password shown once).
 3. Routing → review rules, use Test (simulator) for any domain/IP/port.
@@ -47,9 +49,10 @@ never listens on a public interface by itself).
 - `frontend/` — static Persian RTL panel (no build step)
 - `systemd/` — `proxy-hub.service`, `proxyhub-xray.service`, `proxyhub-singbox.service`
 - `scripts/` — install, set-admin, backup, restore, proxy-env
-- `tests/` — 24 tests (parsers, sync, failover, routing, auth, API)
+- `tests/` — 61 tests (parsers, sync, failover, routing, auth, API,
+  telemetry, CSP/security paths). Run: `.venv/bin/python -m pytest tests/ -q`
 - `docs/` — architecture, installation, security, routing, subscriptions, cores,
-  operations, troubleshooting, API, development, decisions
+  operations, troubleshooting, API, development, decisions, control-panel
 
 ## Safety guarantees
 
