@@ -7,7 +7,7 @@ import logging
 import socket
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -17,6 +17,22 @@ from ..db import get_session_factory
 from ..models import ProxyNode
 
 log = logging.getLogger("proxyhub.health_v2")
+
+
+def _circuit_cooldown_seconds(db) -> int:
+    """Breaker open duration, derived from the configured failover cooldown.
+
+    Returns a sane positive number of seconds even when the setting is
+    missing or malformed. All datetimes involved are timezone-aware UTC.
+    """
+    from ..models import Setting
+
+    try:
+        row = db.query(Setting).filter(Setting.key == "failover_cooldown").first()
+        value = int(row.value) if row else 600
+    except (TypeError, ValueError):
+        value = 600
+    return max(60, value)
 
 # Thread pool for blocking I/O operations
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health-probe")
@@ -258,7 +274,6 @@ class HealthEngineV2:
             except Exception as exc:
                 log.warning("cleanup_loop error: %s", exc)
             await asyncio.sleep(interval)
-            await asyncio.sleep(3600)
     
     async def _fast_check_all(self):
         # Run blocking I/O in thread pool to avoid blocking event loop
@@ -274,21 +289,23 @@ class HealthEngineV2:
             
             now_utc = datetime.now(timezone.utc)
             for node in nodes:
-                if node.circuit_open and node.circuit_open_until:
-                    circuit_until = node.circuit_open_until
-                    if circuit_until.tzinfo is None:
-                        circuit_until = circuit_until.replace(tzinfo=timezone.utc)
-                    if now_utc < circuit_until:
-                        continue
-                    else:
-                        node.circuit_open = False
-                        node.circuit_open_until = None
-                        db.commit()
-                
-                result = tcp_probe(node.server, node.port, timeout=2.0)
-                self._update_fast_metrics(db, node, result)
-            
-            db.commit()
+                try:
+                    if node.circuit_open and node.circuit_open_until:
+                        circuit_until = node.circuit_open_until
+                        if circuit_until.tzinfo is None:
+                            circuit_until = circuit_until.replace(tzinfo=timezone.utc)
+                        if now_utc < circuit_until:
+                            continue
+                        else:
+                            node.circuit_open = False
+                            node.circuit_open_until = None
+
+                    result = tcp_probe(node.server, node.port, timeout=2.0)
+                    self._update_fast_metrics(db, node, result)
+                    db.commit()
+                except Exception as exc:  # one bad node must not stop the sweep
+                    log.warning("fast check failed for node %s: %s", node.id, type(exc).__name__)
+                    db.rollback()
         finally:
             db.close()
     
@@ -343,15 +360,23 @@ class HealthEngineV2:
                 ProxyNode.circuit_open.is_(False)
             ).all()
             
+            # NOTE on attribution: the HTTP probe traverses the ACTIVE node's
+            # outbound, so its result is genuine only for the active node. All
+            # other nodes get a TLS handshake against their OWN server:port —
+            # transport evidence only, never egress evidence. See
+            # _update_active_metrics: egress_ok is set True solely from an
+            # app-level (HTTP) result.
             for node in candidates:
-                if node.id == (active_node.id if active_node else -1):
-                    result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
+                try:
+                    if node.id == (active_node.id if active_node else -1):
+                        result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
+                    else:
+                        result = tls_handshake_probe(node.server, node.port, timeout=5.0)
                     self._update_active_metrics(db, node, result)
-                else:
-                    result = tls_handshake_probe(node.server, node.port, timeout=5.0)
-                    self._update_active_metrics(db, node, result)
-            
-            db.commit()
+                    db.commit()
+                except Exception as exc:  # one bad node must not stop the sweep
+                    log.warning("active check failed for node %s: %s", node.id, type(exc).__name__)
+                    db.rollback()
         finally:
             db.close()
     
@@ -417,25 +442,54 @@ class HealthEngineV2:
         await asyncio.to_thread(self._deep_check_all_sync)
     
     def _deep_check_all_sync(self):
+        """Genuine per-node egress verification, round-robin bounded.
+
+        Each selected node is probed through its OWN outbound via an
+        ephemeral local Xray instance — never through the active node's
+        proxy. At most ``deep_verify_per_cycle`` nodes are verified per
+        cycle (least-recently-checked first); one node's failure never
+        aborts or corrupts the others.
+        """
+        from .cores import verify_node_egress
+
         db = get_session_factory()()
         try:
-            socks_url = self._get_socks_url(db)
-            if not socks_url:
-                return
-            
-            nodes = db.query(ProxyNode).filter(
-                ProxyNode.enabled.is_(True),
-                ProxyNode.removed_upstream.is_(False),
-                ProxyNode.circuit_open.is_(False)
-            ).all()
-            
+            try:
+                per_cycle = int(self._db_setting(db, "deep_verify_per_cycle", "2"))
+            except (TypeError, ValueError):
+                per_cycle = 2
+            per_cycle = max(1, min(per_cycle, 5))
+            nodes = (
+                db.query(ProxyNode)
+                .filter(
+                    ProxyNode.enabled.is_(True),
+                    ProxyNode.removed_upstream.is_(False),
+                    ProxyNode.circuit_open.is_(False),
+                )
+                .order_by(ProxyNode.last_checked.asc().nullsfirst(), ProxyNode.id)
+                .limit(per_cycle)
+                .all()
+            )
             for node in nodes:
-                result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
-                self._update_deep_metrics(db, node, result)
-            
-            db.commit()
+                try:
+                    eg = verify_node_egress(
+                        node, self.settings.health_url, self.settings.health_timeout)
+                    result = ProbeResult(
+                        ok=eg.ok, app_latency_ms=eg.app_latency_ms,
+                        error=eg.error, error_type=eg.error_type)
+                    self._update_deep_metrics(db, node, result)
+                    db.commit()
+                except Exception as exc:  # one bad node must not stop the sweep
+                    log.warning("deep check failed for node %s: %s", node.id, type(exc).__name__)
+                    db.rollback()
         finally:
             db.close()
+
+    def _db_setting(self, db, key: str, default: str) -> str:
+        from ..models import Setting
+
+        row = db.query(Setting).filter(Setting.key == key).first()
+        return row.value if row else default
     
     def _update_deep_metrics(self, db, node: ProxyNode, result: ProbeResult):
         now = datetime.now(timezone.utc)
@@ -468,9 +522,8 @@ class HealthEngineV2:
             
             if node.consecutive_failures >= 5:
                 node.circuit_open = True
-                node.circuit_open_until = datetime.now(timezone.utc).replace(
-                    second=0, microsecond=0
-                )
+                node.circuit_open_until = now + timedelta(
+                    seconds=_circuit_cooldown_seconds(db))
                 if node.health != "unhealthy":
                     node.health = "unhealthy"
                     node.last_state_change = now
@@ -560,17 +613,33 @@ class HealthEngineV2:
             db.close()
     
     async def force_check_node(self, node_id: int) -> dict:
+        """On-demand genuine check of one node.
+
+        The active node is probed through the managed proxy (its own path);
+        any other node is probed through an isolated ephemeral Xray running
+        its own outbound. Results are attributed only to the checked node.
+        """
+        from .cores import verify_node_egress
+
         db = get_session_factory()()
         try:
             node = db.query(ProxyNode).filter(ProxyNode.id == node_id).first()
             if not node:
                 return {"error": "node not found"}
-            
-            socks_url = self._get_socks_url(db)
-            if not socks_url:
-                return {"error": "no proxy available"}
-            
-            result = http_probe_via_proxy(socks_url, self.settings.health_url, self.settings.health_timeout)
+
+            if node.is_active:
+                socks_url = self._get_socks_url(db)
+                if not socks_url:
+                    return {"error": "no proxy available"}
+                result = http_probe_via_proxy(
+                    socks_url, self.settings.health_url, self.settings.health_timeout)
+            else:
+                eg = await asyncio.to_thread(
+                    verify_node_egress, node,
+                    self.settings.health_url, self.settings.health_timeout)
+                result = ProbeResult(
+                    ok=eg.ok, app_latency_ms=eg.app_latency_ms,
+                    error=eg.error, error_type=eg.error_type)
             self._update_deep_metrics(db, node, result)
             db.commit()
             

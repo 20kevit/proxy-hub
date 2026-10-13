@@ -83,13 +83,24 @@ def parse_subscription_text(text: str) -> tuple[list[ParsedNode], dict]:
 
 
 def sync_nodes(session, nodes: list[ParsedNode], source: str = "subscription") -> dict:
-    """Persist normalized nodes; mark vanished subscription nodes as removed_upstream."""
+    """Persist normalized nodes as one planned transition.
+
+    Steps: (1) apply inventory changes; (2) if the active node vanished
+    upstream (removed, or identity changed e.g. rotated credentials, which
+    yields a new fingerprint), select and verify a replacement, apply the
+    core config, and only then transfer the active flag; (3) if no safe
+    replacement exists, record an explicit degraded state instead of
+    leaving the database and the running core silently inconsistent.
+    """
+    from .failover import attempt_transition, eligible_candidates, session_set
+
     now = _utcnow()
     fps = {n.fingerprint() for n in nodes}
     existing: dict[str, ProxyNode] = {
         n.fingerprint: n
         for n in session.query(ProxyNode).filter(ProxyNode.source == source).all()
     }
+    active_before = session.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
     added = updated = 0
     for node in nodes:
         fp = node.fingerprint()
@@ -119,20 +130,82 @@ def sync_nodes(session, nodes: list[ParsedNode], source: str = "subscription") -
                 row.name = node.name
             updated += 1
     removed = 0
+    active_gone = False
     for fp, row in existing.items():
         if fp not in fps and not row.removed_upstream:
             row.removed_upstream = True
-            if row.is_active:
-                row.is_active = False  # never keep a deleted node active
             removed += 1
+    # Commit inventory first: the node list is fact, independent of routing.
     session.commit()
-    return {"added": added, "updated": updated, "removed": removed, "total": len(nodes)}
+    result: dict = {"added": added, "updated": updated, "removed": removed,
+                    "total": len(nodes)}
+    if active_before is not None:
+        still_there = (
+            not active_before.removed_upstream
+            and active_before.fingerprint in fps
+        )
+        if not still_there:
+            active_gone = True
+            active_before.is_active = False
+            session.commit()
+    if not active_gone:
+        session_set(session, "degraded_no_active", "false")
+        return result
+    # Active node vanished: pick a verified replacement before touching flags.
+    eligible, rejected = eligible_candidates(session, exclude_id=None)
+    if not eligible:
+        detail = ", ".join(f"{k}:{v}" for k, v in sorted(rejected.items())) or "none"
+        session_set(session, "degraded_no_active", "true")
+        session_set(session, "degraded_reason",
+                    f"active node vanished upstream; no eligible replacement (rejected: {detail})")
+        log.warning("subscription sync: active node vanished, no eligible replacement "
+                    "(rejected: %s); running core left on previous config", detail)
+        result["active_replacement"] = "none: degraded, manual intervention required"
+        return result
+    candidate = eligible[0]
+
+    def _audit(actor, action, detail):
+        from ..models import AuditLog
+        session.add(AuditLog(actor=actor, action=action, detail=detail))
+        session.commit()
+
+    ok, detail = attempt_transition(
+        session, candidate, None, actor="subscription", audit=_audit,
+        reason_kind="subscription-replacement")
+    if ok:
+        session_set(session, "degraded_no_active", "false")
+        result["active_replacement"] = detail
+    else:
+        session_set(session, "degraded_no_active", "true")
+        session_set(session, "degraded_reason", detail)
+        result["active_replacement"] = f"failed: {detail}"
+    return result
+
+
+def get_effective_url(session) -> str:
+    """Subscription URL source of truth: explicit arg > DB setting > env default.
+
+    The URL lives in the settings table (managed via API), never in files
+    written by the web process. /etc/proxy-hub/proxy-hub.env only provides
+    the initial bootstrap default.
+    """
+    from .failover import session_get
+
+    db_url = session_get(session, "subscription_url", "")
+    if db_url:
+        return db_url
+    return get_settings().subscription_url
+
+
+def set_subscription_url(session, url: str) -> None:
+    from .failover import session_set
+
+    session_set(session, "subscription_url", url)
 
 
 def update_subscription(session, url: str | None = None, timeout: int = 30) -> dict:
     """Full pipeline with history tracking. Keeps last-known-good on failure."""
-    settings = get_settings()
-    url = url or settings.subscription_url
+    url = url or get_effective_url(session)
     if not url:
         raise RuntimeError("subscription URL is not configured")
     state = session.query(SubscriptionState).first()

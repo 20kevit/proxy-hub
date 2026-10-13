@@ -9,7 +9,6 @@ from typing import Optional
 from ..config import get_settings
 from ..db import get_session_factory
 from ..models import ProxyNode
-from .failover import activate_node, pick_failover_candidate
 
 log = logging.getLogger("proxyhub.lifecycle")
 
@@ -50,9 +49,16 @@ class LifecycleManager:
         }
 
     async def _rotation_loop(self):
+        """The single authoritative rotation scheduler.
+
+        NOTE: main.py must NOT run a second loop calling _check_and_rotate;
+        all scheduled rotation flows through this task, and manual rotation
+        through force_rotation_sync. Both funnel into failover.attempt_transition
+        (serialized by transition_lock).
+        """
         while self._running:
             try:
-                await self._check_and_rotate()
+                await asyncio.to_thread(self._check_and_rotate_sync)
             except Exception as exc:
                 log.warning("rotation_loop error: %s", exc)
             await asyncio.sleep(self._get_config_check_interval())
@@ -67,16 +73,24 @@ class LifecycleManager:
             return 300
 
     async def _check_and_rotate(self):
+        """Async wrapper kept for backward compatibility; runs the sync core."""
+        await asyncio.to_thread(self._check_and_rotate_sync)
+
+    def _check_and_rotate_sync(self) -> dict:
+        """Scheduled rotation core (synchronous; runs in a worker thread)."""
+        from ..models import AuditLog as _Audit
+        from .failover import attempt_transition, eligible_candidates, session_set
+
         db = get_session_factory()()
         try:
             config = self._get_config(db)
             if not config["enabled"]:
-                return
+                return {"switched": False, "reason": "rotation disabled"}
 
             active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
             if not active:
                 log.warning("no active node for rotation check")
-                return
+                return {"switched": False, "reason": "no active node"}
 
             max_duration = timedelta(hours=config["max_duration_hours"])
             now_utc = datetime.now(timezone.utc)
@@ -85,92 +99,75 @@ class LifecycleManager:
                 last_change = last_change.replace(tzinfo=timezone.utc)
             active_duration = now_utc - (last_change or now_utc)
             if active_duration < max_duration:
-                # Not yet time for scheduled rotation
-                return
+                return {"switched": False, "reason": "max duration not reached"}
 
-            # Check if we should rotate due to scheduled lifecycle
             candidate = self._select_rotation_candidate(db, active, config)
             if candidate is None:
-                log.info("rotation: no suitable candidate for scheduled rotation of %s", active.name)
-                return
+                log.info("rotation: no suitable candidate for scheduled rotation of %s",
+                         active.name)
+                return {"switched": False, "reason": "no suitable candidate"}
 
             if config["dry_run"]:
-                log.info("rotation (dry-run): would switch %s -> %s", active.name, candidate.name)
-                return
+                log.info("rotation (dry-run): would switch %s -> %s",
+                         active.name, candidate.name)
+                return {"switched": False, "reason": "dry-run mode",
+                        "would_switch_to": candidate.name}
 
             log.info("rotation: scheduled switch %s (duration %.1fh) -> %s",
                      active.name, active_duration.total_seconds() / 3600, candidate.name)
 
-            # Use the same activation mechanism as failover
-            def _audit(actor, action, detail):
-                from ..models import AuditLog
-                db.add(AuditLog(actor=actor, action=action, detail=detail))
-                db.commit()
-
-            from ..models import AuditLog as _Audit
             def audit(actor, action, detail):
                 db.add(_Audit(actor=actor, action=action, detail=detail))
                 db.commit()
 
-            from .failover import session_set
-            reason = f"rotation: {active.name} reached max duration ({config['max_duration_hours']}h) -> {candidate.name}"
-            activate_node(db, candidate, actor="rotation", audit=audit, reason=reason)
-            session_set(db, "last_rotation_at", datetime.now(timezone.utc).isoformat())
-            session_set(db, "last_rotation_reason", reason)
-
+            ok, detail = attempt_transition(
+                db, candidate, active, actor="rotation", audit=audit,
+                reason_kind="rotation")
+            if ok:
+                session_set(db, "last_rotation_at", datetime.now(timezone.utc).isoformat())
+                session_set(db, "last_rotation_reason", detail)
+                return {"switched": True, "reason": detail, "new_node_id": candidate.id}
+            return {"switched": False, "reason": detail}
         finally:
             db.close()
 
     def _select_rotation_candidate(self, db, active: ProxyNode, config: dict) -> Optional[ProxyNode]:
-        """Select best candidate for scheduled rotation."""
+        """Best eligible candidate, preferring nodes outside the use window.
+
+        Eligibility (health, verified egress, circuit, quality) is shared
+        with failover via eligible_candidates; the 24h exclusion window only
+        reorders, and falls back to the full eligible set so rotation never
+        fails merely because every candidate was used recently.
+        """
+        from .failover import eligible_candidates
+
         exclusion_window = timedelta(hours=config["exclusion_window_hours"])
         now = datetime.now(timezone.utc)
-
-        # Find eligible nodes
-        candidates = db.query(ProxyNode).filter(
-            ProxyNode.enabled.is_(True),
-            ProxyNode.removed_upstream.is_(False),
-            ProxyNode.circuit_open.is_(False),
-            ProxyNode.is_active.is_(False),
-            ProxyNode.health == "healthy",
-        ).all()
-
-        if not candidates:
-            return None
-
-        # Filter out recently used nodes
-        eligible = []
-        for node in candidates:
-            recently_used = False
-            # Check if node was active within exclusion window
-            # We track this via last_state_change when it was last activated
-            if node.last_state_change:
-                last_change = node.last_state_change
-                if last_change.tzinfo is None:
-                    last_change = last_change.replace(tzinfo=timezone.utc)
-                if now - last_change < exclusion_window:
-                    # Check if it was activated (became active) recently
-                    # We approximate: if it was active recently, last_state_change would be recent
-                    # For now, we'll use a simpler heuristic
-                    recently_used = True
-
-            if not recently_used:
-                eligible.append(node)
-
+        eligible, _rejected = eligible_candidates(
+            db, exclude_id=active.id if active else None)
         if not eligible:
-            # If all candidates were recently used, fall back to all candidates
+            return None
+        fresh = []
+        for node in eligible:
+            last_change = node.last_state_change
+            if last_change and last_change.tzinfo is None:
+                last_change = last_change.replace(tzinfo=timezone.utc)
+            if last_change is None or (now - last_change) >= exclusion_window:
+                fresh.append(node)
+        pool = fresh or eligible
+        if not fresh:
             log.info("rotation: all candidates recently used, falling back to full set")
-            eligible = candidates
-
-        if not eligible:
-            return None
-
-        # Rank by quality score, preferring nodes with good egress and stability
-        eligible.sort(key=lambda n: (-n.quality_score, n.rank, n.id))
-        return eligible[0]
+        return pool[0]
 
     async def force_rotation(self) -> dict:
         """Manually trigger a rotation check (for API)."""
+        return await asyncio.to_thread(self.force_rotation_sync)
+
+    def force_rotation_sync(self) -> dict:
+        """Manual rotation core (synchronous; runs in a worker thread)."""
+        from ..models import AuditLog as _Audit
+        from .failover import attempt_transition, session_set
+
         db = get_session_factory()()
         try:
             config = self._get_config(db)
@@ -186,26 +183,21 @@ class LifecycleManager:
                 return {"switched": False, "reason": "no suitable candidate"}
 
             if config["dry_run"]:
-                return {"switched": False, "reason": "dry-run mode", "would_switch_to": candidate.name}
+                return {"switched": False, "reason": "dry-run mode",
+                        "would_switch_to": candidate.name}
 
-            def _audit(actor, action, detail):
-                from ..models import AuditLog
-                db.add(AuditLog(actor=actor, action=action, detail=detail))
-                db.commit()
-
-            from ..models import AuditLog as _Audit
             def audit(actor, action, detail):
                 db.add(_Audit(actor=actor, action=action, detail=detail))
                 db.commit()
 
-            from .failover import session_set
-            reason = f"manual rotation: {active.name} -> {candidate.name}"
-            activate_node(db, candidate, actor="rotation", audit=audit, reason=reason)
+            ok, detail = attempt_transition(
+                db, candidate, active, actor="rotation", audit=audit,
+                reason_kind="manual rotation")
+            if not ok:
+                return {"switched": False, "reason": detail}
             session_set(db, "last_rotation_at", datetime.now(timezone.utc).isoformat())
-            session_set(db, "last_rotation_reason", reason)
-
-            return {"switched": True, "reason": reason, "new_node_id": candidate.id}
-
+            session_set(db, "last_rotation_reason", detail)
+            return {"switched": True, "reason": detail, "new_node_id": candidate.id}
         finally:
             db.close()
 

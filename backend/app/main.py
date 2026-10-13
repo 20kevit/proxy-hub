@@ -58,7 +58,7 @@ def _setting(db, key: str, default: str) -> str:
 
 async def subscription_scheduler() -> None:
     from .services.failover import session_get, session_set
-    from .services.subscription import update_subscription
+    from .services.subscription import get_effective_url, update_subscription
 
     await asyncio.sleep(30)
     while True:
@@ -71,7 +71,7 @@ async def subscription_scheduler() -> None:
                 import time as _t
                 now = _t.time()
                 due = not last_ok or (now - float(last_ok or 0)) >= interval
-                if due and settings.subscription_url:
+                if due and get_effective_url(db):
                     try:
                         update_subscription(db)
                     except Exception as exc:
@@ -88,54 +88,52 @@ async def subscription_scheduler() -> None:
             db.close()
 
 
-async def failover_monitor() -> None:
-    from .services.failover import maybe_failover, session_get
-    from .models import AuditLog, ProxyNode
+def _failover_pass() -> None:
+    """One failover evaluation, synchronous (runs in a worker thread).
 
+    maybe_failover now performs fresh pre-switch verification (spawns short
+    helper processes) and config activation, so it must never run on the
+    event loop.
+    """
+    from .models import AuditLog, ProxyNode
+    from .services.failover import maybe_failover
+
+    db = get_session_factory()()
+    try:
+        active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
+        should_failover = False
+        reason = ""
+        if active:
+            if active.health == "unhealthy" and not active.circuit_open:
+                should_failover = True
+                reason = "health unhealthy"
+            elif not active.egress_ok and active.consecutive_failures >= 3:
+                should_failover = True
+                reason = f"egress failures ({active.consecutive_failures})"
+            elif active.consecutive_failures >= 5:
+                should_failover = True
+                reason = f"consecutive failures ({active.consecutive_failures})"
+
+        if should_failover:
+            def _audit(actor, action, detail):
+                db.add(AuditLog(actor=actor, action=action, detail=detail))
+                db.commit()
+            res = maybe_failover(db, active, audit=_audit)
+            if res.get("switched"):
+                log.info("failover: %s (%s)", res.get("reason"), reason)
+    finally:
+        db.close()
+
+
+async def failover_monitor() -> None:
     await asyncio.sleep(10)
     while True:
-        db = get_session_factory()()
         try:
-            active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
-            should_failover = False
-            reason = ""
-            if active:
-                if active.health == "unhealthy" and not active.circuit_open:
-                    should_failover = True
-                    reason = "health unhealthy"
-                elif not active.egress_ok and active.consecutive_failures >= 3:
-                    should_failover = True
-                    reason = f"egress failures ({active.consecutive_failures})"
-                elif active.consecutive_failures >= 5:
-                    should_failover = True
-                    reason = f"consecutive failures ({active.consecutive_failures})"
-            
-            if should_failover:
-                def _audit(actor, action, detail):
-                    db.add(AuditLog(actor=actor, action=action, detail=detail))
-                    db.commit()
-                res = maybe_failover(db, active, audit=_audit)
-                if res.get("switched"):
-                    log.info("failover: %s (%s)", res.get("reason"), reason)
+            await asyncio.to_thread(_failover_pass)
             await asyncio.sleep(5)
         except Exception as exc:
             log.warning("failover monitor error: %s", exc)
             await asyncio.sleep(10)
-        finally:
-            db.close()
-
-
-async def lifecycle_monitor() -> None:
-    """Monitor and execute scheduled node rotations."""
-    from .services.lifecycle import lifecycle_manager
-
-    await asyncio.sleep(60)  # Start after health engine stabilizes
-    while True:
-        try:
-            await lifecycle_manager._check_and_rotate()
-        except Exception as exc:
-            log.warning("lifecycle monitor error: %s", exc)
-        await asyncio.sleep(300)  # Check every 5 minutes
 
 
 @asynccontextmanager
@@ -151,12 +149,13 @@ async def lifespan(app: FastAPI):
     ensure_admin()
 
     await health_engine.start()
+    # LifecycleManager._rotation_loop is the single authoritative rotation
+    # scheduler (manual rotation reuses the same transition path).
     await lifecycle_manager.start()
     await watchdog.start()
 
     sub_task = asyncio.create_task(subscription_scheduler())
     fo_task = asyncio.create_task(failover_monitor())
-    lc_task = asyncio.create_task(lifecycle_monitor())
 
     log.info("proxyhub control plane starting with HealthEngineV2, LifecycleManager, and Watchdog")
     yield
@@ -166,8 +165,7 @@ async def lifespan(app: FastAPI):
     await watchdog.stop()
     sub_task.cancel()
     fo_task.cancel()
-    lc_task.cancel()
-    await asyncio.gather(sub_task, fo_task, lc_task, return_exceptions=True)
+    await asyncio.gather(sub_task, fo_task, return_exceptions=True)
 
 
 app = FastAPI(title="ProxyHub", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
