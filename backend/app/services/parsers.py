@@ -196,6 +196,7 @@ def parse_hysteria2(uri: str) -> ParsedNode:
     qs = parse_qs(u.query)
     params = {
         "obfs": _first(qs, "obfs"),
+        "obfs_password": _first(qs, "obfs-password") or _first(qs, "obfs_password"),
         "sni": _first(qs, "sni") or u.hostname,
         "insecure": _first(qs, "insecure"),
         "pinSHA256": _first(qs, "pinSHA256"),

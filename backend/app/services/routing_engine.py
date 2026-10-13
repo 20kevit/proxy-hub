@@ -187,6 +187,27 @@ def simulate(session, domain: str = "", ip: str = "", port: int | None = None,
     }
 
 
+def validate_client_scope(session, scope: str) -> None:
+    """Ensure a client-scoped rule can actually match traffic.
+
+    A scoped rule compiles to ``inboundTag: gw-<username>``, which only
+    exists when that client has a dedicated inbound port. Rules pointing
+    at clients without one would silently never match, so they are
+    rejected here with an actionable message. Raises RuleError.
+    """
+    from ..models import ProxyClient
+
+    if scope == "all":
+        return
+    client = session.query(ProxyClient).filter(ProxyClient.username == scope).first()
+    if client is None:
+        raise RuleError("کلاینت موردنظر وجود ندارد.")
+    if not client.dedicated_port:
+        raise RuleError(
+            f"کلاینت «{scope}» پورت اختصاصی ندارد؛ قانون client-scope "
+            "بدون inbound اختصاصی هیچ‌وقت تطبیق نمی‌کند.")
+
+
 def to_xray_rule(rule, default_tag: str = "proxy") -> dict:
     """Compile one RouteRule to an Xray routing rule (field type)."""
     tag = {"direct": "direct", "proxy": "proxy", "block": "block"}[rule.action]

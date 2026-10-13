@@ -5,10 +5,14 @@ pre-existing system Xray service (/usr/local/etc/xray/config.json) is never touc
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from ..config import get_settings
@@ -79,7 +83,12 @@ def _vless_outbound(node: ProxyNode) -> dict:
             "spiderX": p.get("spx", "/"),
         }
     elif node.security == "tls":
-        stream["tlsSettings"] = {"serverName": p.get("sni", "") or node.server}
+        tls_settings: dict = {"serverName": p.get("sni", "") or node.server}
+        if p.get("fp"):
+            tls_settings["fingerprint"] = p["fp"]
+        if p.get("alpn"):
+            tls_settings["alpn"] = [a.strip() for a in p["alpn"].split(",") if a.strip()]
+        stream["tlsSettings"] = tls_settings
     if stream["network"] == "ws":
         stream["wsSettings"] = {"path": p.get("path", "/"), "headers": {"Host": p.get("host", "")}}
     elif stream["network"] == "grpc":
@@ -108,6 +117,15 @@ def _vless_outbound(node: ProxyNode) -> dict:
 
 def _vmess_outbound(node: ProxyNode) -> dict:
     p = node.params or {}
+    network = p.get("net", "tcp")
+    stream: dict = {"network": network, "security": node.security or "none"}
+    if node.security == "tls":
+        tls_settings: dict = {"serverName": p.get("sni", "") or node.server}
+        stream["tlsSettings"] = tls_settings
+    if network == "ws":
+        stream["wsSettings"] = {"path": p.get("path", "/"), "headers": {"Host": p.get("host", "")}}
+    elif network == "grpc":
+        stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
     return {
         "protocol": "vmess",
         "tag": "proxy",
@@ -120,16 +138,28 @@ def _vmess_outbound(node: ProxyNode) -> dict:
                 }
             ]
         },
-        "streamSettings": {"network": p.get("net", "tcp"), "security": node.security or "none"},
+        "streamSettings": stream,
     }
 
 
 def _trojan_outbound(node: ProxyNode) -> dict:
+    p = node.params or {}
+    network = p.get("type", "tcp")
+    tls_settings: dict = {"serverName": p.get("sni", "") or node.server}
+    if p.get("fp"):
+        tls_settings["fingerprint"] = p["fp"]
+    if p.get("alpn"):
+        tls_settings["alpn"] = [a.strip() for a in p["alpn"].split(",") if a.strip()]
+    stream: dict = {"network": network, "security": "tls", "tlsSettings": tls_settings}
+    if network == "ws":
+        stream["wsSettings"] = {"path": p.get("path", "/"), "headers": {"Host": p.get("host", "")}}
+    elif network == "grpc":
+        stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
     return {
         "protocol": "trojan",
         "tag": "proxy",
         "settings": {"servers": [{"address": node.server, "port": node.port, "password": node.secret}]},
-        "streamSettings": {"network": "tcp", "security": "tls"},
+        "streamSettings": stream,
     }
 
 
@@ -260,6 +290,13 @@ class XrayAdapter:
                                   [(client.username, password)]))
         for _, port, _ in dedicated:
             _check_port(port, extra={socks_port, http_port})
+        dedicated_users = {username for username, _port, _accts in dedicated}
+        for rule in ordered_rules(session, only_enabled=True):
+            if rule.client_scope != "all" and rule.client_scope not in dedicated_users:
+                raise CoreError(
+                    f"rule #{rule.id} targets client '{rule.client_scope}' which has "
+                    "no dedicated inbound port; give the client a dedicated port "
+                    "or change the rule scope to 'all'")
         xr_rules = [to_xray_rule(r) for r in ordered_rules(session, only_enabled=True)]
         return {"bind": bind, "socks_port": socks_port, "http_port": http_port,
                 "accounts": accounts, "dedicated": dedicated,
@@ -284,14 +321,70 @@ class XrayAdapter:
 
     def validate(self) -> None:
         settings = get_settings()
+        self._validate_path(settings.xray_config)
+
+    def _validate_path(self, path: Path) -> None:
+        """Validate exactly the given file with the installed binary.
+
+        Error strings contain only the validator's stderr (never config
+        content, which holds secrets).
+        """
+        settings = get_settings()
         if not shutil.which(settings.xray_bin) and not Path(settings.xray_bin).exists():
             raise CoreError(f"xray binary not found: {settings.xray_bin}")
         proc = subprocess.run(
-            [settings.xray_bin, "run", "-test", "-config", str(settings.xray_config)],
+            [settings.xray_bin, "run", "-test", "-config", str(path)],
             capture_output=True, text=True, timeout=30,
         )
         if proc.returncode != 0:
             raise CoreError(f"xray config invalid: {proc.stderr.strip()[:400]}")
+
+    def _write_candidate(self, node: ProxyNode, session=None) -> Path:
+        """Write the candidate config to a unique temp file (NOT live yet).
+
+        Same directory/filesystem as the live file (atomic rename later),
+        restrictive permissions and ownership applied before validation.
+        Caller must unlink the temp file (success and failure paths).
+        """
+        settings = get_settings()
+        gateway = self.gateway_context(session) if session is not None else None
+        cfg = self.generate(node, gateway=gateway)
+        settings.xray_config.parent.mkdir(parents=True, exist_ok=True)
+        _lock_down(settings.xray_config.parent)
+        _chown_proxyhub(settings.xray_config.parent)
+        fd, tmp = tempfile.mkstemp(prefix="xray-", suffix=".json",
+                                   dir=str(settings.xray_config.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+            os.chmod(tmp, 0o600)
+            _chown_proxyhub(Path(tmp))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return Path(tmp)
+
+    def _backup_live(self) -> Path | None:
+        """Copy the current live config aside; best-effort, may return None."""
+        settings = get_settings()
+        live = settings.xray_config
+        if not live.exists():
+            return None
+        backup = live.with_suffix(".prev")
+        try:
+            shutil.copy2(live, backup)
+            try:
+                backup.chmod(0o600)
+            except OSError:
+                pass
+            _chown_proxyhub(backup)
+            return backup
+        except OSError as exc:
+            log.warning("config backup failed: %s", type(exc).__name__)
+            return None
 
     def _svc(self, action: str) -> str:
         proc = subprocess.run(
@@ -326,20 +419,72 @@ class XrayAdapter:
         prev_active = None
         if session is not None:
             prev_active = session.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
-        
-        self.write_config(node, session=session)
-        self.validate()
-        
-        if force_restart or prev_active is None or prev_active.id != node.id:
+
+        # 1-3. candidate temp file -> validate the EXACT file -> then replace.
+        # The known-good live config is never touched before validation passes.
+        candidate = self._write_candidate(node, session=session)
+        try:
+            self._validate_path(candidate)
+        except Exception:
             try:
-                self._svc("restart")
-            except CoreError:
-                self._svc("start")
-        else:
+                candidate.unlink()
+            except OSError:
+                pass
+            raise
+        backup = self._backup_live()
+        try:
+            candidate.replace(get_settings().xray_config)
+        except OSError as exc:
             try:
-                self.reload()
-            except CoreError:
-                self._svc("restart")
+                candidate.unlink()
+            except OSError:
+                pass
+            raise CoreError(f"config replace failed: {type(exc).__name__}")
+        _chown_proxyhub(get_settings().xray_config)
+
+        # 4. apply with rollback: on failure restore the previous config.
+        try:
+            if force_restart or prev_active is None or prev_active.id != node.id:
+                try:
+                    self._svc("restart")
+                except CoreError:
+                    self._svc("start")
+            else:
+                try:
+                    self.reload()
+                except CoreError:
+                    self._svc("restart")
+        except CoreError as exc:
+            if backup is not None:
+                try:
+                    shutil.copy2(backup, get_settings().xray_config)
+                    self._svc("restart")
+                    log.warning("activation failed; restored previous config")
+                except (OSError, CoreError) as rb_exc:
+                    log.error("rollback failed: %s", type(rb_exc).__name__)
+            raise CoreError(f"activation failed, previous config restored: {exc}") from exc
+
+    def status(self) -> dict:
+        """Read-only status of the managed proxyhub-xray service.
+
+        Never raises: returns {"active": bool, "state": str} where state is
+        one of active|inactive|failed|unknown|missing.
+        """
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", "proxyhub-xray"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            return {"active": False, "state": "missing"}
+        except subprocess.TimeoutExpired:
+            return {"active": False, "state": "unknown"}
+        except OSError:
+            return {"active": False, "state": "unknown"}
+        state = (proc.stdout or "").strip().lower() or "unknown"
+        if state not in ("active", "inactive", "failed", "activating", "deactivating"):
+            state = "unknown"
+        return {"active": state == "active", "state": state}
 
 
 def rebuild_gateway(session) -> dict:
@@ -354,12 +499,6 @@ def rebuild_gateway(session) -> dict:
         raise CoreError("no active node to rebuild gateway for")
     XrayAdapter().apply(active, session=session)
     return {"ok": True, "node_id": active.id}
-
-    def status(self) -> dict:
-        proc = subprocess.run(
-            ["systemctl", "is-active", "proxyhub-xray"], capture_output=True, text=True, timeout=10
-        )
-        return {"active": proc.stdout.strip() == "active", "state": proc.stdout.strip()}
 
 
 class SingBoxAdapter:
@@ -378,6 +517,13 @@ class SingBoxAdapter:
         if node.protocol != "hysteria2":
             raise CoreError(f"sing-box adapter asked for protocol: {node.protocol}")
         p = node.params or {}
+        # Fail closed on unsupported TLS modes rather than silently changing
+        # verification semantics: insecure=1 would disable verification, and
+        # pinSHA256 requires pinning support we do not implement.
+        if str(p.get("insecure", "")).lower() in ("1", "true", "yes"):
+            raise CoreError("hysteria2 with insecure TLS is not supported (verification stays on)")
+        if p.get("pinSHA256"):
+            raise CoreError("hysteria2 with pinSHA256 is not supported")
         hy: dict = {
             "type": "hysteria2",
             "tag": "proxy",
@@ -387,7 +533,7 @@ class SingBoxAdapter:
             "tls": {"enabled": True, "server_name": p.get("sni") or node.server},
         }
         if p.get("obfs"):
-            hy["obfs"] = {"type": p["obfs"], "password": ""}
+            hy["obfs"] = {"type": p["obfs"], "password": p.get("obfs_password", "")}
         return {
             "log": {"level": "warn"},
             "inbounds": [
@@ -417,23 +563,104 @@ class SingBoxAdapter:
 
     def validate(self) -> None:
         settings = get_settings()
+        self._validate_path(settings.singbox_config)
+
+    def _validate_path(self, path: Path) -> None:
+        settings = get_settings()
         if not self.installed():
             raise CoreError("sing-box is not installed")
         proc = subprocess.run(
-            [settings.singbox_bin, "check", "-c", str(settings.singbox_config)],
+            [settings.singbox_bin, "check", "-c", str(path)],
             capture_output=True, text=True, timeout=30,
         )
         if proc.returncode != 0:
             raise CoreError(f"sing-box config invalid: {proc.stderr.strip()[:400]}")
 
     def apply(self, node: ProxyNode) -> None:
-        self.write_config(node)
-        self.validate()
+        """Validate the candidate file before replacing the live config.
+
+        On restart failure the previous config is restored, so a bad
+        candidate never destroys the last known-good working config.
+        """
+        settings = get_settings()
+        settings.singbox_config.parent.mkdir(parents=True, exist_ok=True)
+        _lock_down(settings.singbox_config.parent)
+        _chown_proxyhub(settings.singbox_config.parent)
+        fd, tmp = tempfile.mkstemp(prefix="singbox-", suffix=".json",
+                                   dir=str(settings.singbox_config.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self.generate(node), fh, indent=2)
+            os.chmod(tmp, 0o600)
+            _chown_proxyhub(Path(tmp))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        candidate = Path(tmp)
+        try:
+            self._validate_path(candidate)
+        except Exception:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+            raise
+        backup: Path | None = None
+        if settings.singbox_config.exists():
+            backup = settings.singbox_config.with_suffix(".prev")
+            try:
+                shutil.copy2(settings.singbox_config, backup)
+                backup.chmod(0o600)
+            except OSError:
+                backup = None
+        try:
+            candidate.replace(settings.singbox_config)
+        except OSError as exc:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+            raise CoreError(f"config replace failed: {type(exc).__name__}")
+        _chown_proxyhub(settings.singbox_config)
         proc = subprocess.run(
             ["systemctl", "restart", "proxyhub-singbox"], capture_output=True, text=True, timeout=60
         )
         if proc.returncode != 0:
+            if backup is not None:
+                try:
+                    shutil.copy2(backup, settings.singbox_config)
+                    subprocess.run(["systemctl", "restart", "proxyhub-singbox"],
+                                   capture_output=True, text=True, timeout=60)
+                except OSError:
+                    pass
             raise CoreError(f"proxyhub-singbox restart failed: {proc.stderr.strip()[:300]}")
+
+    def status(self) -> dict:
+        """Read-only status of the managed proxyhub-singbox service.
+
+        Never raises: returns {"active": bool, "state": str} where state is
+        one of active|inactive|failed|unknown|missing|not-installed.
+        """
+        if not self.installed():
+            return {"active": False, "state": "not-installed"}
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", "proxyhub-singbox"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except FileNotFoundError:
+            return {"active": False, "state": "missing"}
+        except subprocess.TimeoutExpired:
+            return {"active": False, "state": "unknown"}
+        except OSError:
+            return {"active": False, "state": "unknown"}
+        state = (proc.stdout or "").strip().lower() or "unknown"
+        if state not in ("active", "inactive", "failed", "activating", "deactivating"):
+            state = "unknown"
+        return {"active": state == "active", "state": state}
 
 
 def adapter_for(node: ProxyNode):
@@ -442,6 +669,162 @@ def adapter_for(node: ProxyNode):
     if node.protocol == "hysteria2":
         return SingBoxAdapter()
     raise CoreError(f"no core adapter for protocol: {node.protocol}")
+
+
+@dataclasses.dataclass
+class EgressResult:
+    """Outcome of a genuine per-node egress verification.
+
+    ok=True means an HTTP request reached the test URL *through this node's
+    own outbound*. Any other outcome leaves the node's verified-egress state
+    untouched by the caller.
+    """
+
+    ok: bool
+    app_latency_ms: float | None = None
+    error: str = ""
+    error_type: str = ""  # timeout|tls_error|reset|connect_error|http_error|unverified|internal
+
+
+class EphemeralXray:
+    """Temporary Xray instance routing a single node, for egress verification.
+
+    Binds 127.0.0.1 on an OS-assigned port; config lives in a 0600 temp file
+    next to the managed config and is always removed. Never touches the
+    running managed core or its configuration file.
+    """
+
+    def __init__(self, node: ProxyNode) -> None:
+        builder = XRAY_BUILDERS.get(node.protocol)
+        if builder is None:
+            raise CoreError(f"ephemeral check cannot handle protocol: {node.protocol}")
+        self._node = node
+        self._builder = builder
+        self._proc: subprocess.Popen | None = None
+        self._cfg_path: Path | None = None
+        self.port: int = 0
+
+    def _free_port(self) -> int:
+        import socket as _socket
+
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def __enter__(self) -> str:
+        settings = get_settings()
+        if not shutil.which(settings.xray_bin) and not Path(settings.xray_bin).exists():
+            raise CoreError(f"xray binary not found: {settings.xray_bin}")
+        self.port = self._free_port()
+        cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {"listen": "127.0.0.1", "port": self.port, "protocol": "socks",
+                 "settings": {"udp": True}, "tag": "verify-in"},
+            ],
+            "outbounds": [
+                self._builder(self._node),
+                {"protocol": "freedom", "tag": "direct"},
+            ],
+        }
+        settings.xray_config.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="verify-", suffix=".json",
+                                   dir=str(settings.xray_config.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh)
+            os.chmod(tmp, 0o600)
+            self._cfg_path = Path(tmp)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        check = subprocess.run(
+            [settings.xray_bin, "run", "-test", "-config", tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+        if check.returncode != 0:
+            self._cleanup()
+            raise CoreError(f"verify config invalid: {check.stderr.strip()[:200]}")
+        self._proc = subprocess.Popen(
+            [settings.xray_bin, "run", "-config", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 8.0
+        import socket as _socket
+
+        while time.monotonic() < deadline:
+            if self._proc.poll() is not None:
+                self._cleanup()
+                raise CoreError("verify xray exited during startup")
+            try:
+                with _socket.create_connection(("127.0.0.1", self.port), timeout=0.5):
+                    return f"socks5h://127.0.0.1:{self.port}"
+            except OSError:
+                time.sleep(0.2)
+        self._cleanup()
+        raise CoreError("verify xray did not listen in time")
+
+    def __exit__(self, *exc_info) -> None:
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        if self._proc is not None:
+            proc, self._proc = self._proc, None
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            except OSError:
+                pass
+        if self._cfg_path is not None:
+            path, self._cfg_path = self._cfg_path, None
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def verify_node_egress(node: ProxyNode, test_url: str, timeout: int = 15) -> EgressResult:
+    """Genuinely verify one node's egress via an isolated ephemeral Xray.
+
+    Never raises for probe failures (returns EgressResult); raises CoreError
+    only for local environment problems (missing binary), which callers treat
+    as 'unverified'. No secrets are included in error strings.
+    """
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        with EphemeralXray(node) as proxy_url:
+            try:
+                import httpx as _httpx
+
+                with _httpx.Client(proxy=proxy_url, timeout=timeout) as client:
+                    resp = client.get(test_url)
+                    resp.raise_for_status()
+                    ms = round((_time.monotonic() - started) * 1000, 1)
+                    return EgressResult(ok=True, app_latency_ms=ms)
+            except Exception as exc:  # noqa: BLE001 - mapped below, never re-raised
+                name = type(exc).__name__
+                text = str(exc)
+                if "Timeout" in name or "timeout" in text.lower():
+                    return EgressResult(ok=False, error="http_timeout", error_type="timeout")
+                if "SSL" in text or "TLS" in text:
+                    return EgressResult(ok=False, error="tls_error", error_type="tls_error")
+                if "reset" in text.lower():
+                    return EgressResult(ok=False, error="reset", error_type="reset")
+                if "HTTPStatusError" in name or "Status" in name:
+                    return EgressResult(ok=False, error="http_error", error_type="http_error")
+                return EgressResult(ok=False, error=name, error_type="connect_error")
+    except CoreError as exc:
+        return EgressResult(ok=False, error=str(exc)[:200], error_type="unverified")
 
 
 def system_xray_status() -> dict:

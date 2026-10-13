@@ -14,6 +14,7 @@ from ..services.routing_engine import (
     ordered_rules,
     rule_matches,
     simulate,
+    validate_client_scope,
     validate_rule,
 )
 from .deps import current_user, db_session
@@ -58,9 +59,10 @@ def create_rule(payload: RouteRuleIn, user: str = Depends(current_user)):
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         scope = (payload.client_scope or "all").strip().lower()
-        if scope != "all" and not db.query(ProxyClient).filter(
-                ProxyClient.username == scope).first():
-            raise HTTPException(400, "کلاینت موردنظر وجود ندارد.")
+        try:
+            validate_client_scope(db, scope)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         rule = RouteRule(priority=payload.priority, match_type=payload.match_type,
                          pattern=pattern, port=port, network=payload.network,
                          action=payload.action, client_scope=scope,
@@ -90,9 +92,10 @@ def update_rule(rule_id: int, payload: RouteRuleIn, user: str = Depends(current_
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         scope = (payload.client_scope or "all").strip().lower()
-        if scope != "all" and not db.query(ProxyClient).filter(
-                ProxyClient.username == scope).first():
-            raise HTTPException(400, "کلاینت موردنظر وجود ندارد.")
+        try:
+            validate_client_scope(db, scope)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         rule.priority = payload.priority
         rule.match_type = payload.match_type
         rule.pattern = pattern
