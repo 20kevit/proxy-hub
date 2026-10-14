@@ -112,6 +112,7 @@ function showTab(name, push = true) {
   document.querySelectorAll(".tab").forEach((t) => t.classList.add("hidden"));
   $("tab-" + name).classList.remove("hidden");
   document.body.classList.remove("navopen");
+  $("scrim").classList.add("hidden");
   $("menuBtn").setAttribute("aria-expanded", "false");
   if (push && location.hash !== "#/" + name) history.replaceState(null, "", "#/" + name);
 }
@@ -120,8 +121,9 @@ window.addEventListener("hashchange", () => showTab(location.hash.replace("#/", 
 $("menuBtn").onclick = () => {
   const open = document.body.classList.toggle("navopen");
   $("menuBtn").setAttribute("aria-expanded", open ? "true" : "false");
+  $("scrim").classList.toggle("hidden", !open);
 };
-$("scrim").onclick = () => { document.body.classList.remove("navopen"); };
+$("scrim").onclick = () => { document.body.classList.remove("navopen"); $("scrim").classList.add("hidden"); };
 
 const dot = (c) => `<span class="dot ${c}" aria-hidden="true"></span>`;
 const hdot = (h) => h === "HEALTHY" ? dot("ok") : h === "UNHEALTHY" ? dot("bad") : h === "DEGRADED" ? dot("warn") : dot("off");
