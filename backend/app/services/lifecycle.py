@@ -203,6 +203,8 @@ class LifecycleManager:
 
     def get_rotation_status(self, db) -> dict:
         """Get current rotation status."""
+        from .failover import session_get
+
         config = self._get_config(db)
         active = db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first()
 
@@ -217,18 +219,23 @@ class LifecycleManager:
         active_duration = now_utc - (last_change or now_utc)
         remaining = max_duration - active_duration
 
+        # NOTE: never return the raw ORM object here — FastAPI would
+        # serialize every column including secret credentials.
         return {
             "enabled": config["enabled"],
             "dry_run": config["dry_run"],
             "active_node": {
                 "id": active.id,
                 "name": active.name,
+                "protocol": active.protocol,
+                "quality_score": active.quality_score,
                 "duration_hours": round(active_duration.total_seconds() / 3600, 1),
                 "max_duration_hours": config["max_duration_hours"],
                 "remaining_hours": round(max(0, remaining.total_seconds() / 3600), 1),
             },
             "next_check_in_seconds": config["check_interval_seconds"],
-            "last_rotation": db.query(ProxyNode).filter(ProxyNode.is_active.is_(True)).first(),
+            "last_rotation_at": session_get(db, "last_rotation_at", ""),
+            "last_rotation_reason": session_get(db, "last_rotation_reason", ""),
         }
 
 

@@ -279,7 +279,8 @@ async function loadLifecycle() {
     $("lifecycleStatus").innerHTML = a
       ? `<table><tr><td>نود فعال</td><td>${esc(a.name)} (#${a.id})</td></tr>
          <tr><td>مدت فعالیت</td><td dir="ltr">${a.duration_hours}h / ${a.max_duration_hours}h (باقی‌مانده ${a.remaining_hours}h)</td></tr>
-         <tr><td>سیاست</td><td>فعال: ${s.enabled ? "بله" : "خیر"} · dry-run: ${s.dry_run ? "بله" : "خیر"}</td></tr></table>`
+         <tr><td>سیاست</td><td>فعال: ${s.enabled ? "بله" : "خیر"} · dry-run: ${s.dry_run ? "بله" : "خیر"}</td></tr>
+         <tr><td>آخرین چرخش</td><td dir="ltr">${esc(s.last_rotation_at || "—")}</td></tr></table>`
       : `<p class="muted">نود فعالی وجود ندارد.</p>`;
     $("lifecycleRotate").innerHTML = `<p class="muted">چرخش دستی به بهترین نود سالم واجدشرایط انجام می‌شود.</p>`;
     const rows = await api("/api/audit?action=node.activate&limit=20");

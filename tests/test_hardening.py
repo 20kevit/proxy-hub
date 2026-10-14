@@ -1127,3 +1127,31 @@ def test_session_expiry_rejected():
     sig = _m.new(get_settings().secret_key.encode(), payload.encode(),
                  _h.sha256).hexdigest()
     assert _auth.parse_session(f"{payload}.{sig}") is None
+
+
+def test_lifecycle_status_never_leaks_secrets(db):
+    """Regression: /api/lifecycle/status must not serialize node secrets."""
+    from test_api import _client_with_admin as _cwa
+    from app.services import auth as _auth
+
+    # Active node WITH a real secret: the old code serialized the whole row.
+    _mk(db, "leak-probe-node", active=True)
+    db.query(ProxyNode).filter(
+        ProxyNode.fingerprint == "fp-leak-probe-node").update(
+        {"secret": "SUPERSECRET-UUID-1234"})
+    db.commit()
+    _auth._attempts.clear()
+    from test_api import _login
+    c = _login(_cwa())
+    r = c.get("/api/lifecycle/status")
+    assert r.status_code == 200, r.text
+    blob = r.text.lower()
+    for forbidden in ('"secret"', '"password"', "private", "begin private",
+                      "pbk", "sid", "password_enc", "password_hash"):
+        assert forbidden not in blob, forbidden
+    d = r.json()
+    assert "active_node" in d
+    if d["active_node"] is not None:
+        assert set(d["active_node"]).issubset(
+            {"id", "name", "protocol", "quality_score", "duration_hours",
+             "max_duration_hours", "remaining_hours"})
