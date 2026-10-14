@@ -71,6 +71,7 @@ let confirmResolve = null;
 function confirmDlg(text) {
   $("confirmText").textContent = text;
   const d = $("confirmDialog");
+  if (d.open) d.close();
   d.showModal();
   return new Promise((resolve) => { confirmResolve = resolve; });
 }
@@ -429,7 +430,7 @@ function clientConfig(id) {
   const c = CLIENTS.find((x) => x.id === id);
   if (!c) return;
   const srvHost = location.hostname || "server";
-  const cfg = `SOCKS5\nServer: ${srvHost}\nPort: ${GW.socks_port || "?"}\nUsername: ${c.username}\nPassword: (only shown at create/rotate)\n\nHTTP\nServer: ${srvHost}\nPort: ${GW.http_port || "?"}\nUsername: ${c.username}`;
+  const cfg = `SOCKS5\nServer: ${srvHost}\nPort: ${GW.socks_port || "?"}\nUsername: ${c.username}\nPassword: (فقط لحظه‌ی ساخت/چرخش)\n\nHTTP\nServer: ${srvHost}\nPort: ${GW.http_port || "?"}\nUsername: ${c.username}`;
   const summary = "socks5://" + c.username + "@" + srvHost + ":" + (GW.socks_port || "?");
   $("cfg-" + id).innerHTML = `<pre dir="ltr">${esc(cfg)}</pre><button class="btn small" data-action="copy-summary" data-text="${esc(summary)}">کپی خلاصه (بدون گذرواژه)</button>`;
 }
@@ -457,10 +458,13 @@ async function clientDel(id) {
 function openClientDlg(c) {
   $("clientDlgTitle").textContent = c ? "ویرایش دستگاه" : "دستگاه جدید";
   $("clientId").value = c?.id || "";
-  $("clientName").value = c?.name || ""; $("clientUser").value = c && c.username ? "" : "";
+  $("clientName").value = c?.name || "";
+  $("clientUser").value = "";
   $("clientUser").placeholder = c ? "تغییر نام کاربری پشتیبانی نمی‌شود" : "laptop_x7";
   $("clientUser").disabled = !!c;
-  $("clientPass").value = ""; $("clientPass").placeholder = c ? "خالی = بدون تغییر گذرواژه" : "خالی = تولید خودکار";
+  $("clientPass").value = "";
+  $("clientPass").disabled = !!c;
+  $("clientPass").placeholder = c ? "تغییر گذرواژه فقط با «چرخش گذرواژه»" : "خالی = تولید خودکار";
   $("clientExp").value = c?.expires_at ? String(c.expires_at).slice(0, 10) : "";
   $("clientNote").value = c?.notes || "";
   $("clientSave").textContent = c ? "ذخیره" : "ساخت";
@@ -477,8 +481,8 @@ $("clientSave").onclick = (e) => {
   busy($("clientSave"), async () => {
     try {
       if (id) {
-        const body = { name, notes: $("clientNote").value };
-        if ($("clientExp").value) body.expires_at = $("clientExp").value;
+        /* Backend clears expiry on falsy value, so always send it (allows clearing). */
+        const body = { name, notes: $("clientNote").value, expires_at: $("clientExp").value || "" };
         await api(`/api/clients/${id}`, { method: "PATCH", body: JSON.stringify(body) });
         $("clientDialog").close(); toast("ذخیره شد"); await loadClients();
       } else {
